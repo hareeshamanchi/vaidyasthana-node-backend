@@ -14,17 +14,14 @@ const app = express();
 
 app.use(
   cors({
-    origin: [
-      "http://localhost:3000",
-      "https://vaidyasthana-frontend.onrender.com",
-    ],
+    origin: process.env.FRONTEND_URL,
     credentials: true,
   })
 );
 
 /*
 |--------------------------------------------------------------------------
-| Middleware
+| Body Parser
 |--------------------------------------------------------------------------
 */
 
@@ -33,7 +30,7 @@ app.use(express.urlencoded({ extended: true }));
 
 /*
 |--------------------------------------------------------------------------
-| Routes
+| API Routes
 |--------------------------------------------------------------------------
 */
 
@@ -52,8 +49,30 @@ app.get("/", (req, res) => {
 
 /*
 |--------------------------------------------------------------------------
-| Export
+| 404 Route
 |--------------------------------------------------------------------------
 */
+
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: "API Route Not Found",
+  });
+});
+
+/*
+|--------------------------------------------------------------------------
+| Error Handler
+|--------------------------------------------------------------------------
+*/
+
+app.use((err, req, res, next) => {
+  console.error(err);
+
+  res.status(500).json({
+    success: false,
+    message: "Internal Server Error",
+  });
+});
 
 module.exports = app;
