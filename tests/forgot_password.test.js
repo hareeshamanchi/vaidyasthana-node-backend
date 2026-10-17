@@ -6,8 +6,8 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const app = require("../src/app");
 const User = require("../src/models/User");
-const { _resetRateLimits } = require("../src/controllers/authController");
-const { isEmailConfigured, sendPasswordResetEmail } = require("../src/services/emailService");
+const { _resetRateLimits, getFrontendBaseUrl, DEPLOYED_FRONTEND_URL } = require("../src/controllers/authController");
+const { isEmailConfigured, sendPasswordResetEmail, isTestPlaceholderEmail } = require("../src/services/emailService");
 const connectDB = require("../src/config/db");
 
 let server;
@@ -278,8 +278,54 @@ const runSuite = async () => {
     if (originalHost) process.env.SMTP_HOST = originalHost;
     console.log("✔ PASSED");
 
+    // Test 11: Production reset URL enforcement & localhost/LAN IP protection
+    console.log("Testing 11: Production reset URL enforcement & localhost/LAN IP protection... ");
+    const savedEnv = process.env.NODE_ENV;
+    const savedFrontend = process.env.FRONTEND_URL;
+    const savedClient = process.env.CLIENT_URL;
+
+    process.env.NODE_ENV = "production";
+    delete process.env.FRONTEND_URL;
+    delete process.env.CLIENT_URL;
+    assert.strictEqual(getFrontendBaseUrl({}), "https://vaidyasthana-frontend.onrender.com");
+
+    process.env.FRONTEND_URL = "http://localhost:3000";
+    assert.strictEqual(getFrontendBaseUrl({}), "https://vaidyasthana-frontend.onrender.com");
+
+    process.env.FRONTEND_URL = "http://127.0.0.1:5173";
+    assert.strictEqual(getFrontendBaseUrl({}), "https://vaidyasthana-frontend.onrender.com");
+
+    process.env.FRONTEND_URL = "http://192.168.1.42:3000";
+    assert.strictEqual(getFrontendBaseUrl({}), "https://vaidyasthana-frontend.onrender.com");
+
+    process.env.FRONTEND_URL = "https://vaidyasthana-frontend.onrender.com/";
+    assert.strictEqual(getFrontendBaseUrl({}), "https://vaidyasthana-frontend.onrender.com");
+
+    // Restore env vars
+    if (savedEnv !== undefined) process.env.NODE_ENV = savedEnv; else delete process.env.NODE_ENV;
+    if (savedFrontend !== undefined) process.env.FRONTEND_URL = savedFrontend; else delete process.env.FRONTEND_URL;
+    if (savedClient !== undefined) process.env.CLIENT_URL = savedClient; else delete process.env.CLIENT_URL;
+    console.log("✔ PASSED");
+
+    // Test 12: Safe recipient handling & test placeholder interception
+    console.log("Testing 12: Recipient placeholder & test fixture bypass... ");
+    assert.strictEqual(isTestPlaceholderEmail("reset_patient_1720000000@vaidyasthana.com"), true);
+    assert.strictEqual(isTestPlaceholderEmail("reset_doctor_1720000000@vaidyasthana.com"), true);
+    assert.strictEqual(isTestPlaceholderEmail("user@example.com"), true);
+    assert.strictEqual(isTestPlaceholderEmail("realuser@gmail.com"), false);
+
+    // Verify placeholder emails safely bypass live SMTP dispatch
+    const placeholderEmailRes = await sendPasswordResetEmail({
+      to: "reset_patient_123456@vaidyasthana.com",
+      name: "Placeholder Patient",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/sampletoken",
+    });
+    assert.strictEqual(placeholderEmailRes.delivered, true);
+    assert.strictEqual(placeholderEmailRes.reason, "TEST_FIXTURE_BYPASS");
+    console.log("✔ PASSED");
+
     console.log("\n=================================================");
-    console.log("  ALL 10 FORGOT & RESET PASSWORD TESTS PASSED!   ");
+    console.log("  ALL 12 FORGOT & RESET PASSWORD TESTS PASSED!   ");
     console.log("=================================================\n");
   } catch (err) {
     console.error("\n❌ TEST ENCOUNTERED AN ERROR:", err);

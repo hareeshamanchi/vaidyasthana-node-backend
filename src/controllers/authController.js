@@ -512,6 +512,58 @@ const updateProfile = async (req, res) => {
   }
 };
 
+const DEPLOYED_FRONTEND_URL = "https://vaidyasthana-frontend.onrender.com";
+
+/**
+ * Determines the frontend base URL for password reset links.
+ * Strictly avoids localhost, 127.0.0.1, or private LAN IPs in production.
+ *
+ * @param {Object} req - Express request object
+ * @returns {string} - Clean base URL without trailing slash
+ */
+const getFrontendBaseUrl = (req) => {
+  let candidate = (
+    process.env.FRONTEND_URL ||
+    process.env.CLIENT_URL ||
+    ""
+  ).trim();
+
+  // If candidate is not explicitly set
+  if (!candidate) {
+    if (process.env.NODE_ENV === "production") {
+      return DEPLOYED_FRONTEND_URL;
+    }
+    const origin = req?.get ? req.get("origin") : req?.headers?.origin;
+    if (origin && !origin.includes("localhost") && !origin.includes("127.0.0.1")) {
+      return origin.replace(/\/+$/, "");
+    }
+    return DEPLOYED_FRONTEND_URL;
+  }
+
+  // Remove trailing slashes
+  candidate = candidate.replace(/\/+$/, "");
+
+  // Detect localhost, 127.0.0.1, or private LAN IPs
+  const isLocalOrPrivate =
+    /^(https?:\/\/)?(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?/i.test(
+      candidate
+    );
+
+  if (process.env.NODE_ENV === "production" && isLocalOrPrivate) {
+    console.warn(
+      `[SAFE_LOG] FRONTEND_URL (${candidate}) points to local/private network in production. Overriding with official deployed URL (${DEPLOYED_FRONTEND_URL}).`
+    );
+    return DEPLOYED_FRONTEND_URL;
+  }
+
+  // Ensure valid HTTP/HTTPS protocol
+  if (!candidate.startsWith("http://") && !candidate.startsWith("https://")) {
+    candidate = `https://${candidate}`;
+  }
+
+  return candidate;
+};
+
 // ==========================================
 // Request Password Reset
 // POST /api/auth/forgot-password
@@ -548,7 +600,7 @@ const forgotPassword = async (req, res) => {
 
     const user = await User.findOne({ email: normalizedEmail });
 
-    // Anti-enumeration generic response
+    // Anti-enumeration generic response (consistent whether user exists or not)
     const genericResponse = {
       success: true,
       message: "If an account exists for this email, password reset instructions will be sent.",
@@ -558,7 +610,31 @@ const forgotPassword = async (req, res) => {
       return res.status(200).json(genericResponse);
     }
 
-    // Cryptographically secure single-use token
+    // Safety verification: The user account must have a real, valid email address
+    if (
+      !user.email ||
+      typeof user.email !== "string" ||
+      !emailRegex.test(user.email.trim())
+    ) {
+      console.warn(
+        `[SAFE_LOG] Account found for reset but has missing or invalid email format. Skipping email dispatch.`
+      );
+      return res.status(200).json(genericResponse);
+    }
+
+    const recipientEmail = user.email.trim().toLowerCase();
+
+    // Guard against placeholder / fake domains if any exist in DB
+    const placeholderDomains = ["example.com", "example.org", "test.com", "placeholder.com"];
+    const emailDomain = recipientEmail.split("@")[1];
+    if (placeholderDomains.includes(emailDomain)) {
+      console.warn(
+        `[SAFE_LOG] Account email domain (${emailDomain}) is a known placeholder. Skipping email dispatch.`
+      );
+      return res.status(200).json(genericResponse);
+    }
+
+    // Cryptographically secure single-use token (32 bytes = 256 bits entropy)
     const rawToken = crypto.randomBytes(32).toString("hex");
     const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
 
@@ -572,20 +648,17 @@ const forgotPassword = async (req, res) => {
     createNotification({
       userId: user._id,
       title: "Security Alert: Password Reset Requested",
-      message: "A password reset request was initiated for your account. If you did not make this request, please review your account immediately.",
+      message:
+        "A password reset request was initiated for your account. If you did not make this request, please review your account immediately.",
       type: "security_event",
       link: "/forgot-password",
     }).catch((e) => console.error("Forgot pass notify error:", e.message));
 
-    const frontendBaseUrl = (
-      process.env.FRONTEND_URL ||
-      process.env.CLIENT_URL ||
-      "http://localhost:3000"
-    ).replace(/\/+$/, "");
+    const frontendBaseUrl = getFrontendBaseUrl(req);
     const resetUrl = `${frontendBaseUrl}/reset-password/${rawToken}`;
 
     const emailResult = await sendPasswordResetEmail({
-      to: user.email,
+      to: recipientEmail,
       name: user.name,
       resetUrl,
       expiresInMinutes,
@@ -597,11 +670,11 @@ const forgotPassword = async (req, res) => {
       ...genericResponse,
       emailDelivery: {
         configured: isConfigured,
-        delivered: emailResult.delivered,
+        delivered: Boolean(emailResult.delivered),
         reason: emailResult.reason || (emailResult.delivered ? "DELIVERED" : "FAILED"),
       },
-      // In development when email is not configured, supply devResetUrl for local verification
-      ...(process.env.NODE_ENV !== "production" && !emailResult.delivered
+      // In local development only (when NODE_ENV is development and email unconfigured), supply devResetUrl
+      ...(process.env.NODE_ENV === "development" && !emailResult.delivered
         ? { devResetUrl: resetUrl }
         : {}),
     });
@@ -736,4 +809,6 @@ module.exports = {
   validateResetToken,
   resetPassword,
   _resetRateLimits,
+  getFrontendBaseUrl,
+  DEPLOYED_FRONTEND_URL,
 };
