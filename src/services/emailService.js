@@ -1,15 +1,82 @@
 const nodemailer = require("nodemailer");
 
 /**
+ * Parses and sanitizes SMTP configuration from environment variables.
+ * Handles whitespace, surrounding quotes, port-specific TLS rules, and Gmail App Passwords.
+ *
+ * @returns {{ host: string, port: number, secure: boolean, user: string, pass: string, from: string, configured: boolean }}
+ */
+const getSmtpConfig = () => {
+  const rawHost = (process.env.SMTP_HOST || process.env.EMAIL_HOST || "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+  const rawPort = (process.env.SMTP_PORT || "").trim().replace(/^["']|["']$/g, "");
+  const rawUser = (process.env.SMTP_USER || process.env.EMAIL_USER || "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+  let rawPass = (process.env.SMTP_PASS || process.env.SMTP_PASSWORD || "")
+    .trim()
+    .replace(/^["']|["']$/g, "");
+  const rawFrom = (process.env.SMTP_FROM || "").trim().replace(/^["']|["']$/g, "");
+  const rawSecure = process.env.SMTP_SECURE;
+
+  const port = parseInt(rawPort, 10) || 587;
+
+  // Google App Password format handling: 16 characters, often copied with spaces ("abcd efgh ijkl mnop")
+  const isGoogle = rawHost.includes("gmail") || rawHost.includes("google");
+  if (
+    isGoogle &&
+    rawPass.replace(/\s+/g, "").length === 16 &&
+    /^[a-z]{16}$/i.test(rawPass.replace(/\s+/g, ""))
+  ) {
+    rawPass = rawPass.replace(/\s+/g, "");
+  }
+
+  // Port and TLS mapping:
+  // Port 465 is direct SSL/TLS (secure: true)
+  // Port 587 / 25 / 2525 is opportunistic/explicit STARTTLS (secure: false)
+  // Prevent common bug where SMTP_SECURE=true is set on port 587, causing TLS handshake hang
+  let isSecure = port === 465;
+  if (rawSecure !== undefined) {
+    if (port === 465) {
+      isSecure = true;
+    } else if (port === 587 || port === 25 || port === 2525) {
+      isSecure = false;
+    } else {
+      isSecure = rawSecure === "true";
+    }
+  }
+
+  return {
+    host: rawHost,
+    port,
+    secure: isSecure,
+    user: rawUser,
+    pass: rawPass,
+    from: rawFrom,
+    configured: Boolean(rawHost && rawUser && rawPass),
+  };
+};
+
+/**
  * Checks whether the SMTP email transport credentials are fully configured.
  * @returns {boolean}
  */
 const isEmailConfigured = () => {
-  return Boolean(
-    process.env.SMTP_HOST &&
-      process.env.SMTP_USER &&
-      process.env.SMTP_PASS
-  );
+  const config = getSmtpConfig();
+  return config.configured;
+};
+
+/**
+ * Masks sensitive credential strings for safe diagnostic logging.
+ *
+ * @param {string} str
+ * @returns {string}
+ */
+const maskSecret = (str) => {
+  if (!str) return "[NOT_SET]";
+  if (str.length <= 4) return "****";
+  return `${str.slice(0, 2)}****${str.slice(-2)}`;
 };
 
 /**
@@ -204,23 +271,26 @@ const isTestPlaceholderEmail = (email) => {
 
 /**
  * Sends a password reset email using nodemailer if SMTP credentials are configured.
- * Safely handles unconfigured states without crashing or logging secrets.
+ * Safely handles unconfigured states, timeouts, and sanitized error diagnostics without crashing or logging secrets.
  *
  * @param {Object} options
  * @param {string} options.to - Real recipient email address
  * @param {string} options.name - Recipient user's name
  * @param {string} options.resetUrl - Full password reset URL with single-use token
  * @param {number} [options.expiresInMinutes=15] - Expiration duration in minutes
- * @returns {Promise<{ delivered: boolean, messageId?: string, reason?: string, missingEnv?: string[], accepted?: string[], rejected?: string[] }>}
+ * @returns {Promise<{ delivered: boolean, messageId?: string, reason?: string, missingEnv?: string[], accepted?: string[], rejected?: string[], smtpAccepted?: boolean, inboxDeliveryGuaranteed?: boolean, deliveryNote?: string, diagnosticMessage?: string }>}
  */
 const sendPasswordResetEmail = async ({ to, name, resetUrl, expiresInMinutes = 15 }) => {
-  if (!isEmailConfigured()) {
-    const missing = ["SMTP_HOST", "SMTP_USER", "SMTP_PASS"].filter(
-      (envVar) => !process.env[envVar]
-    );
+  const config = getSmtpConfig();
+
+  if (!config.configured) {
+    const missing = [];
+    if (!config.host) missing.push("SMTP_HOST");
+    if (!config.user) missing.push("SMTP_USER");
+    if (!config.pass) missing.push("SMTP_PASS");
 
     console.warn(
-      `[SAFE_LOG] SMTP service is not configured (missing: ${missing.join(
+      `[SAFE_DIAGNOSTIC] SMTP service is not configured (missing: ${missing.join(
         ", "
       )}). Password reset email could not be dispatched.`
     );
@@ -235,43 +305,48 @@ const sendPasswordResetEmail = async ({ to, name, resetUrl, expiresInMinutes = 1
   // Intercept test fixture / placeholder emails to avoid outbound bounces
   if (isTestPlaceholderEmail(to)) {
     console.log(
-      `[SAFE_LOG] Email address (${to}) is recognized as an internal test placeholder. Bypassing live outbound SMTP dispatch.`
+      `[SAFE_DIAGNOSTIC] Email address (${to}) is recognized as an internal test placeholder. Bypassing live outbound SMTP dispatch.`
     );
     return {
       delivered: true,
       messageId: `<mock-test-${Date.now()}@vaidyasthana.internal>`,
       reason: "TEST_FIXTURE_BYPASS",
       accepted: [to],
+      smtpAccepted: true,
+      inboxDeliveryGuaranteed: true,
     };
   }
 
   try {
-    const port = parseInt(process.env.SMTP_PORT, 10) || 587;
-    const isSecure = process.env.SMTP_SECURE === "true" || port === 465;
+    console.log(
+      `[SAFE_DIAGNOSTIC] Initializing SMTP Transport -> Host: ${config.host}, Port: ${config.port}, Secure: ${config.secure}, User: ${maskSecret(config.user)}`
+    );
 
     const transporter = nodemailer.createTransport({
-      host: process.env.SMTP_HOST,
-      port,
-      secure: isSecure,
+      host: config.host,
+      port: config.port,
+      secure: config.secure,
       auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
+        user: config.user,
+        pass: config.pass,
       },
+      connectionTimeout: 10000, // 10s TCP/TLS connection timeout
+      greetingTimeout: 10000,   // 10s SMTP greeting timeout
+      socketTimeout: 15000,     // 15s socket timeout
     });
 
     // Determine correct From header based on email provider requirements
-    let fromAddress = (process.env.SMTP_FROM || "").trim();
-    const smtpHost = (process.env.SMTP_HOST || "").toLowerCase();
-    const smtpUser = (process.env.SMTP_USER || "").trim();
+    let fromAddress = config.from;
+    const isGoogle = config.host.includes("gmail") || config.host.includes("google");
 
     if (!fromAddress) {
-      fromAddress = `"Vaidyasthana Healthcare" <${smtpUser}>`;
-    } else if (smtpHost.includes("gmail") && !fromAddress.includes(smtpUser)) {
+      fromAddress = `"Vaidyasthana Healthcare" <${config.user}>`;
+    } else if (isGoogle && !fromAddress.includes(config.user)) {
       // Gmail SMTP requires the sender address to match the authenticated account
       // Preserve display name while ensuring sender matches SMTP_USER to prevent 553 error
       const nameMatch = fromAddress.match(/^"?([^"<]+)"?\s*</);
       const displayName = nameMatch ? nameMatch[1].trim() : "Vaidyasthana Healthcare";
-      fromAddress = `"${displayName}" <${smtpUser}>`;
+      fromAddress = `"${displayName}" <${config.user}>`;
     }
 
     const htmlContent = generatePasswordResetEmailHtml({
@@ -296,38 +371,93 @@ const sendPasswordResetEmail = async ({ to, name, resetUrl, expiresInMinutes = 1
 
     if (!isAccepted || wasRejected) {
       console.warn(
-        `[SAFE_LOG] SMTP provider did not confirm acceptance for recipient ${to}. Response: ${info.response || "No response details"}`
+        `[SAFE_DIAGNOSTIC] SMTP provider did not confirm acceptance for recipient ${to}. Response: ${info.response || "No response details"}`
       );
       return {
         delivered: false,
         reason: "PROVIDER_REJECTED",
+        smtpAccepted: false,
+        inboxDeliveryGuaranteed: false,
         response: info.response,
         rejected: info.rejected || [],
       };
     }
 
     console.log(
-      `[SAFE_LOG] Password reset email delivered successfully. MessageId: ${info.messageId}`
+      `[SAFE_DIAGNOSTIC] Password reset email accepted by SMTP relay. MessageId: ${info.messageId} | Response: ${info.response}`
     );
+    console.log(
+      `[SAFE_DIAGNOSTIC] [IMPORTANT NOTICE]: SMTP acceptance confirms upstream relay handoff. Final delivery to user inbox depends on recipient spam filters, domain reputation, and SPF/DKIM/DMARC authentication.`
+    );
+
     return {
       delivered: true,
       messageId: info.messageId,
       accepted: info.accepted,
+      smtpAccepted: true,
+      inboxDeliveryGuaranteed: false,
+      deliveryNote: "Upstream relay accepted message for delivery. Final inbox delivery depends on recipient spam filters and SPF/DKIM records.",
       response: info.response,
     };
   } catch (error) {
-    console.error(`[SAFE_LOG] Failed to send password reset email: ${error.message}`);
+    let reason = "SMTP_TRANSMISSION_ERROR";
+    let userFriendlyMessage = "Failed to communicate with SMTP server.";
+
+    const errMsg = (error.message || "").toLowerCase();
+    const errCode = error.code || "";
+    const responseCode = error.responseCode || 0;
+
+    if (
+      errCode === "EAUTH" ||
+      responseCode === 535 ||
+      errMsg.includes("invalid login") ||
+      errMsg.includes("badcredentials") ||
+      errMsg.includes("username and password not accepted")
+    ) {
+      reason = "SMTP_AUTHENTICATION_FAILED";
+      userFriendlyMessage =
+        "SMTP authentication failed. Verify SMTP_USER and SMTP_PASS (for Gmail, ensure 2FA is active and use a 16-character App Password).";
+    } else if (
+      errCode === "ETIMEDOUT" ||
+      errCode === "ECONNECTION" ||
+      errCode === "ESOCKET" ||
+      errMsg.includes("timeout") ||
+      errMsg.includes("greeting never received")
+    ) {
+      reason = "SMTP_CONNECTION_TIMEOUT";
+      userFriendlyMessage = `SMTP connection timed out on port ${config.port}. Render may block port 25, or port ${config.port} / TLS setting (secure: ${config.secure}) is mismatched.`;
+    } else if (
+      errCode === "EENVELOPE" ||
+      responseCode === 550 ||
+      responseCode === 553 ||
+      errMsg.includes("sender address rejected")
+    ) {
+      reason = "SMTP_SENDER_REJECTED";
+      userFriendlyMessage =
+        "SMTP sender address was rejected. When using Gmail/Google, SMTP_FROM must match the authenticated SMTP_USER.";
+    } else if (errCode === "ENOTFOUND" || errCode === "EAI_AGAIN") {
+      reason = "SMTP_DNS_RESOLUTION_FAILED";
+      userFriendlyMessage = `DNS resolution failed for SMTP_HOST (${config.host}). Verify hostname in environment variables.`;
+    }
+
+    console.error(
+      `[SAFE_DIAGNOSTIC] SMTP Transmission Failed: [${reason}] ${userFriendlyMessage} (Code: ${errCode || responseCode || "N/A"})`
+    );
+
     return {
       delivered: false,
-      reason: "SMTP_TRANSMISSION_ERROR",
-      error: error.message,
+      reason,
+      diagnosticMessage: userFriendlyMessage,
+      code: errCode || responseCode || undefined,
     };
   }
 };
 
 module.exports = {
   isEmailConfigured,
+  getSmtpConfig,
   sendPasswordResetEmail,
   isTestPlaceholderEmail,
   generatePasswordResetEmailHtml,
 };
+

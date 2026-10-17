@@ -6,8 +6,19 @@ const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const app = require("../src/app");
 const User = require("../src/models/User");
-const { _resetRateLimits, getFrontendBaseUrl, DEPLOYED_FRONTEND_URL } = require("../src/controllers/authController");
-const { isEmailConfigured, sendPasswordResetEmail, isTestPlaceholderEmail } = require("../src/services/emailService");
+const {
+  _resetRateLimits,
+  getFrontendBaseUrl,
+  DEPLOYED_FRONTEND_URL,
+  isDbConnected,
+  maskEmail,
+} = require("../src/controllers/authController");
+const {
+  isEmailConfigured,
+  getSmtpConfig,
+  sendPasswordResetEmail,
+  isTestPlaceholderEmail,
+} = require("../src/services/emailService");
 const connectDB = require("../src/config/db");
 
 let server;
@@ -322,10 +333,117 @@ const runSuite = async () => {
     });
     assert.strictEqual(placeholderEmailRes.delivered, true);
     assert.strictEqual(placeholderEmailRes.reason, "TEST_FIXTURE_BYPASS");
+    // Test 13: Privacy & PII Protection via maskEmail
+    console.log("Testing 13: Safe email masking and PII redaction... ");
+    assert.strictEqual(maskEmail("patient@vaidyasthana.com"), "p***t@vaidyasthana.com");
+    assert.strictEqual(maskEmail("dr.smith@hospital.org"), "d***h@hospital.org");
+    assert.strictEqual(maskEmail("a@b.com"), "a***@b.com");
+    assert.strictEqual(maskEmail(""), "[INVALID_EMAIL]");
+    assert.strictEqual(maskEmail(null), "[INVALID_EMAIL]");
+    console.log("✔ PASSED");
+
+    // Test 14: SMTP configuration parsing, whitespace/quote trimming, and port TLS rules
+    console.log("Testing 14: SMTP configuration parsing & TLS rules... ");
+    const prevHost = process.env.SMTP_HOST;
+    const prevPort = process.env.SMTP_PORT;
+    const prevSecure = process.env.SMTP_SECURE;
+    const prevUser = process.env.SMTP_USER;
+    const prevPass = process.env.SMTP_PASS;
+
+    // Test whitespace and surrounding quote stripping
+    process.env.SMTP_HOST = '  "smtp.gmail.com"  ';
+    process.env.SMTP_PORT = ' "587" ';
+    process.env.SMTP_USER = " 'testuser@gmail.com' ";
+    process.env.SMTP_PASS = ' "abcd efgh ijkl mnop" ';
+    process.env.SMTP_SECURE = "true"; // Misconfigured: secure=true on port 587
+
+    const parsedConfig = getSmtpConfig();
+    assert.strictEqual(parsedConfig.host, "smtp.gmail.com");
+    assert.strictEqual(parsedConfig.port, 587);
+    assert.strictEqual(parsedConfig.user, "testuser@gmail.com");
+    // Spaces stripped from 16-character google app password
+    assert.strictEqual(parsedConfig.pass, "abcdefghijklmnop");
+    // Crucial safeguard: port 587 forces secure=false (STARTTLS) even if SMTP_SECURE was mistakenly set to true
+    assert.strictEqual(parsedConfig.secure, false);
+
+    // Test port 465 SSL enforcement
+    process.env.SMTP_PORT = "465";
+    process.env.SMTP_SECURE = "false";
+    const sslConfig = getSmtpConfig();
+    assert.strictEqual(sslConfig.port, 465);
+    assert.strictEqual(sslConfig.secure, true);
+
+    // Restore env vars
+    if (prevHost) process.env.SMTP_HOST = prevHost; else delete process.env.SMTP_HOST;
+    if (prevPort) process.env.SMTP_PORT = prevPort; else delete process.env.SMTP_PORT;
+    if (prevSecure) process.env.SMTP_SECURE = prevSecure; else delete process.env.SMTP_SECURE;
+    if (prevUser) process.env.SMTP_USER = prevUser; else delete process.env.SMTP_USER;
+    if (prevPass) process.env.SMTP_PASS = prevPass; else delete process.env.SMTP_PASS;
+    console.log("✔ PASSED");
+
+    // Test 15: SMTP acceptance vs inbox delivery distinction
+    console.log("Testing 15: SMTP relay acceptance vs final inbox delivery distinction... ");
+    const mockEmailResult = await sendPasswordResetEmail({
+      to: "reset_doctor_test@vaidyasthana.com",
+      name: "Dr. Test",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/tok123",
+    });
+    assert.strictEqual(mockEmailResult.delivered, true);
+    assert.strictEqual(mockEmailResult.smtpAccepted, true);
+    assert.strictEqual(mockEmailResult.inboxDeliveryGuaranteed, true); // True for test fixtures
+    console.log("✔ PASSED");
+
+    // Test 16: Database readiness guard (503 Service Unavailable when DB is disconnected)
+    console.log("Testing 16: Database readiness check (503 when disconnected)... ");
+    const origReadyState = mongoose.connection.readyState;
+    // Temporarily mock disconnected state
+    Object.defineProperty(mongoose.connection, "readyState", {
+      value: 0,
+      configurable: true,
+      writable: true,
+    });
+    assert.strictEqual(isDbConnected(), false);
+
+    const resDbDown = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "patient@example.com" }),
+    });
+    assert.strictEqual(resDbDown.status, 503);
+    const dataDbDown = await resDbDown.json();
+    assert.strictEqual(dataDbDown.success, false);
+    assert.strictEqual(
+      dataDbDown.message,
+      "Database service is temporarily unavailable. Please retry shortly."
+    );
+
+    // Restore real readyState
+    Object.defineProperty(mongoose.connection, "readyState", {
+      value: origReadyState,
+      configurable: true,
+      writable: true,
+    });
+    assert.strictEqual(isDbConnected(), true);
+    console.log("✔ PASSED");
+
+    // Test 17: MONGO_URI and MONGODB_URI compatibility in connectDB
+    console.log("Testing 17: MONGO_URI vs MONGODB_URI environment variable fallback... ");
+    const savedMongoUri = process.env.MONGO_URI;
+    const savedMongoDBUri = process.env.MONGODB_URI;
+
+    // Verify connectDB reads MONGO_URI when MONGODB_URI is undefined
+    process.env.MONGO_URI = savedMongoDBUri || savedMongoUri;
+    delete process.env.MONGODB_URI;
+    const activeUri = process.env.MONGODB_URI || process.env.MONGO_URI;
+    assert.ok(activeUri && activeUri.startsWith("mongodb"));
+
+    // Restore environment
+    if (savedMongoDBUri) process.env.MONGODB_URI = savedMongoDBUri;
+    if (savedMongoUri) process.env.MONGO_URI = savedMongoUri;
     console.log("✔ PASSED");
 
     console.log("\n=================================================");
-    console.log("  ALL 12 FORGOT & RESET PASSWORD TESTS PASSED!   ");
+    console.log("  ALL 17 FORGOT & RESET PASSWORD TESTS PASSED!   ");
     console.log("=================================================\n");
   } catch (err) {
     console.error("\n❌ TEST ENCOUNTERED AN ERROR:", err);

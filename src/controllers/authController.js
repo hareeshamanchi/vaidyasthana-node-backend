@@ -515,8 +515,25 @@ const updateProfile = async (req, res) => {
 const DEPLOYED_FRONTEND_URL = "https://vaidyasthana-frontend.onrender.com";
 
 /**
+ * Masks an email address for safe diagnostic logging without leaking PII.
+ * Example: 'patient@example.com' -> 'p***t@example.com'
+ *
+ * @param {string} email
+ * @returns {string}
+ */
+const maskEmail = (email) => {
+  if (!email || typeof email !== "string" || !email.includes("@")) return "[INVALID_EMAIL]";
+  const [localPart, domain] = email.split("@");
+  if (localPart.length <= 2) {
+    return `${localPart[0]}***@${domain}`;
+  }
+  return `${localPart[0]}***${localPart[localPart.length - 1]}@${domain}`;
+};
+
+/**
  * Determines the frontend base URL for password reset links.
  * Strictly avoids localhost, 127.0.0.1, or private LAN IPs in production.
+ * Ensures HTTPS protocol in production.
  *
  * @param {Object} req - Express request object
  * @returns {string} - Clean base URL without trailing slash
@@ -526,7 +543,10 @@ const getFrontendBaseUrl = (req) => {
     process.env.FRONTEND_URL ||
     process.env.CLIENT_URL ||
     ""
-  ).trim();
+  )
+    .trim()
+    .replace(/^["']|["']$/g, "")
+    .replace(/\/+$/, "");
 
   // If candidate is not explicitly set
   if (!candidate) {
@@ -540,25 +560,31 @@ const getFrontendBaseUrl = (req) => {
     return DEPLOYED_FRONTEND_URL;
   }
 
-  // Remove trailing slashes
-  candidate = candidate.replace(/\/+$/, "");
-
   // Detect localhost, 127.0.0.1, or private LAN IPs
   const isLocalOrPrivate =
     /^(https?:\/\/)?(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)(:\d+)?/i.test(
       candidate
     );
 
-  if (process.env.NODE_ENV === "production" && isLocalOrPrivate) {
-    console.warn(
-      `[SAFE_LOG] FRONTEND_URL (${candidate}) points to local/private network in production. Overriding with official deployed URL (${DEPLOYED_FRONTEND_URL}).`
-    );
-    return DEPLOYED_FRONTEND_URL;
+  if (process.env.NODE_ENV === "production") {
+    if (isLocalOrPrivate) {
+      console.warn(
+        `[SAFE_DIAGNOSTIC] FRONTEND_URL (${candidate}) points to local/private network in production. Overriding with official deployed HTTPS URL (${DEPLOYED_FRONTEND_URL}).`
+      );
+      return DEPLOYED_FRONTEND_URL;
+    }
+    // In production, force HTTPS
+    if (candidate.startsWith("http://")) {
+      candidate = candidate.replace(/^http:\/\//i, "https://");
+    } else if (!candidate.startsWith("https://")) {
+      candidate = `https://${candidate}`;
+    }
+    return candidate;
   }
 
-  // Ensure valid HTTP/HTTPS protocol
+  // Development/Test environment: ensure valid protocol prefix
   if (!candidate.startsWith("http://") && !candidate.startsWith("https://")) {
-    candidate = `https://${candidate}`;
+    candidate = `http://${candidate}`;
   }
 
   return candidate;
@@ -572,6 +598,7 @@ const forgotPassword = async (req, res) => {
   try {
     const { email } = req.body;
 
+    // Stage 1: Input Validation & Sanitization
     if (!email || typeof email !== "string" || !email.trim()) {
       return res.status(400).json({
         success: false,
@@ -589,15 +616,33 @@ const forgotPassword = async (req, res) => {
       });
     }
 
+    console.log(
+      `[SAFE_DIAGNOSTIC] Stage 1: Forgot-password request received for masked address: ${maskEmail(normalizedEmail)}`
+    );
+
     // Rate limiting guard (5 requests per 15 minutes by IP or Email)
     const clientIp = req.ip || req.headers["x-forwarded-for"] || "ip-unknown";
     if (isRateLimited(`ip:${clientIp}`) || isRateLimited(`email:${normalizedEmail}`)) {
+      console.warn(`[SAFE_DIAGNOSTIC] Stage 1: Rate limit triggered for IP or email.`);
       return res.status(429).json({
         success: false,
         message: "Too many password reset requests. Please wait 15 minutes before trying again.",
       });
     }
 
+    // Stage 2: Database Connection Readiness Check
+    if (!isDbConnected()) {
+      console.error(
+        "[SAFE_DIAGNOSTIC] Stage 2: Database connection not ready (readyState !== 1). Returning 503 Service Unavailable."
+      );
+      return res.status(503).json({
+        success: false,
+        message: "Database service is temporarily unavailable. Please retry shortly.",
+      });
+    }
+    console.log("[SAFE_DIAGNOSTIC] Stage 2: Database connection readiness check PASSED.");
+
+    // Stage 3: Account Lookup & Anti-Enumeration Protection
     const user = await User.findOne({ email: normalizedEmail });
 
     // Anti-enumeration generic response (consistent whether user exists or not)
@@ -607,8 +652,14 @@ const forgotPassword = async (req, res) => {
     };
 
     if (!user) {
+      console.log(
+        "[SAFE_DIAGNOSTIC] Stage 3: Account lookup completed. No account matched. Returning generic anti-enumeration response."
+      );
       return res.status(200).json(genericResponse);
     }
+    console.log(
+      `[SAFE_DIAGNOSTIC] Stage 3: Account lookup completed. Account found (Role: ${user.role}). Proceeding with single-use token generation.`
+    );
 
     // Safety verification: The user account must have a real, valid email address
     if (
@@ -617,7 +668,7 @@ const forgotPassword = async (req, res) => {
       !emailRegex.test(user.email.trim())
     ) {
       console.warn(
-        `[SAFE_LOG] Account found for reset but has missing or invalid email format. Skipping email dispatch.`
+        `[SAFE_DIAGNOSTIC] Account found for reset but has missing or invalid email format. Skipping email dispatch.`
       );
       return res.status(200).json(genericResponse);
     }
@@ -629,12 +680,12 @@ const forgotPassword = async (req, res) => {
     const emailDomain = recipientEmail.split("@")[1];
     if (placeholderDomains.includes(emailDomain)) {
       console.warn(
-        `[SAFE_LOG] Account email domain (${emailDomain}) is a known placeholder. Skipping email dispatch.`
+        `[SAFE_DIAGNOSTIC] Account email domain (${emailDomain}) is a known placeholder. Skipping email dispatch.`
       );
       return res.status(200).json(genericResponse);
     }
 
-    // Cryptographically secure single-use token (32 bytes = 256 bits entropy)
+    // Stage 4: Cryptographically secure single-use token (32 bytes = 256 bits entropy)
     const rawToken = crypto.randomBytes(32).toString("hex");
     const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
 
@@ -643,6 +694,9 @@ const forgotPassword = async (req, res) => {
     user.resetPasswordToken = hashedToken;
     user.resetPasswordExpires = new Date(Date.now() + expiresInMinutes * 60 * 1000);
     await user.save();
+    console.log(
+      `[SAFE_DIAGNOSTIC] Stage 4: Cryptographic token generated (256-bit entropy). SHA-256 digest committed to MongoDB Atlas. Expiry: ${expiresInMinutes} minutes.`
+    );
 
     // Notify user of security event
     createNotification({
@@ -654,9 +708,17 @@ const forgotPassword = async (req, res) => {
       link: "/forgot-password",
     }).catch((e) => console.error("Forgot pass notify error:", e.message));
 
+    // Stage 5: URL Construction & Origin Verification
     const frontendBaseUrl = getFrontendBaseUrl(req);
     const resetUrl = `${frontendBaseUrl}/reset-password/${rawToken}`;
+    console.log(
+      `[SAFE_DIAGNOSTIC] Stage 5: Reset URL generated using base origin: ${frontendBaseUrl}. Target route: /reset-password/<token_hash_redacted>. Verified HTTPS: ${resetUrl.startsWith("https://")}`
+    );
 
+    // Stage 6 & 7: SMTP Dispatch
+    console.log(
+      `[SAFE_DIAGNOSTIC] Stage 6 & 7: Dispatching password reset email to masked recipient ${maskEmail(recipientEmail)}.`
+    );
     const emailResult = await sendPasswordResetEmail({
       to: recipientEmail,
       name: user.name,
@@ -666,12 +728,19 @@ const forgotPassword = async (req, res) => {
 
     const isConfigured = isEmailConfigured();
 
+    // Stage 8: Delivery Confirmation & Distinction
+    console.log(
+      `[SAFE_DIAGNOSTIC] Stage 8: Email dispatch result: delivered=${emailResult.delivered}, reason=${emailResult.reason}. (Note: SMTP acceptance confirms upstream relay handoff; inbox delivery depends on recipient spam filters/DNS).`
+    );
+
     return res.status(200).json({
       ...genericResponse,
       emailDelivery: {
         configured: isConfigured,
         delivered: Boolean(emailResult.delivered),
         reason: emailResult.reason || (emailResult.delivered ? "DELIVERED" : "FAILED"),
+        smtpAccepted: Boolean(emailResult.smtpAccepted),
+        inboxDeliveryGuaranteed: Boolean(emailResult.inboxDeliveryGuaranteed),
       },
       // In local development only (when NODE_ENV is development and email unconfigured), supply devResetUrl
       ...(process.env.NODE_ENV === "development" && !emailResult.delivered
@@ -679,7 +748,7 @@ const forgotPassword = async (req, res) => {
         : {}),
     });
   } catch (error) {
-    console.error("Forgot Password Error:", error);
+    console.error("[SAFE_DIAGNOSTIC] Forgot Password Error:", error.message);
     return res.status(500).json({
       success: false,
       message: "An internal server error occurred while processing your request.",
@@ -693,6 +762,13 @@ const forgotPassword = async (req, res) => {
 // ==========================================
 const validateResetToken = async (req, res) => {
   try {
+    if (!isDbConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: "Database service is temporarily unavailable. Please retry shortly.",
+      });
+    }
+
     const { token } = req.params;
 
     if (!token || typeof token !== "string" || token.length < 16) {
@@ -721,7 +797,7 @@ const validateResetToken = async (req, res) => {
       message: "Password reset token is valid.",
     });
   } catch (error) {
-    console.error("Validate Reset Token Error:", error);
+    console.error("[SAFE_DIAGNOSTIC] Validate Reset Token Error:", error.message);
     return res.status(500).json({
       success: false,
       message: "An error occurred while validating the reset token.",
@@ -735,6 +811,13 @@ const validateResetToken = async (req, res) => {
 // ==========================================
 const resetPassword = async (req, res) => {
   try {
+    if (!isDbConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: "Database service is temporarily unavailable. Please retry shortly.",
+      });
+    }
+
     const { token } = req.params;
     const { password } = req.body;
 
@@ -785,14 +868,14 @@ const resetPassword = async (req, res) => {
       link: "/",
     }).catch((e) => console.error("Reset pass notify error:", e.message));
 
-    console.log(`[SAFE_LOG] Password reset successfully completed for user ${user._id} (${user.role}).`);
+    console.log(`[SAFE_DIAGNOSTIC] Password reset successfully completed for user ${user._id} (${user.role}).`);
 
     return res.status(200).json({
       success: true,
       message: "Your password has been reset successfully. You can now sign in with your new credentials.",
     });
   } catch (error) {
-    console.error("Reset Password Error:", error);
+    console.error("[SAFE_DIAGNOSTIC] Reset Password Error:", error.message);
     return res.status(500).json({
       success: false,
       message: "An error occurred while resetting your password. Please try again.",
@@ -811,4 +894,6 @@ module.exports = {
   _resetRateLimits,
   getFrontendBaseUrl,
   DEPLOYED_FRONTEND_URL,
+  isDbConnected,
+  maskEmail,
 };
