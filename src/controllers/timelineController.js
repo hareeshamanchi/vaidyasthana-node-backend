@@ -2,6 +2,7 @@ const mongoose = require("mongoose");
 const Report = require("../models/Report");
 const Appointment = require("../models/Appointment");
 const User = require("../models/User");
+const { expireStaleAppointments } = require("../services/appointmentExpiryService");
 const {
   isDoctorAuthorizedForPatient,
   resolvePatientUser,
@@ -63,7 +64,7 @@ const formatAppointmentTimelineEvent = (appointment) => {
   const apptDate = appObj.appointmentDate || appObj.createdAt || new Date();
   const todayMidnight = new Date(new Date().setHours(0, 0, 0, 0));
   const isDateFutureOrToday = new Date(apptDate) >= todayMidnight;
-  const nonActiveStatuses = ["Completed", "Cancelled", "Rejected", "completed", "cancelled", "rejected"];
+  const nonActiveStatuses = ["Completed", "Cancelled", "Rejected", "Expired", "completed", "cancelled", "rejected", "expired"];
   const isUpcoming = isDateFutureOrToday && !nonActiveStatuses.includes(appObj.status);
 
   return {
@@ -283,6 +284,12 @@ const getPatientTimeline = async (req, res) => {
     // 2. Fetch Appointments
     if (shouldIncludeAppointments) {
       if (isDbConnected()) {
+        try {
+          await expireStaleAppointments({ patientId: targetPatientId });
+        } catch (expErr) {
+          // non-blocking
+        }
+
         const apptFilter = {
           patientId: mongoose.Types.ObjectId.isValid(targetPatientId)
             ? new mongoose.Types.ObjectId(targetPatientId)

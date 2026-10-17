@@ -378,7 +378,7 @@ describe("Real-Time Video Consultation Access & Security Suite", () => {
     assert.strictEqual(res.status, 400);
     assert.strictEqual(res.body.success, false);
     assert.strictEqual(res.body.error, "CONSULTATION_NOT_STARTED");
-    assert.ok(res.body.message.includes("Starts at"));
+    assert.ok(/starts at/i.test(res.body.message));
   });
 
   it("13. Expired join attempt after 30-minute grace period is rejected with 400 and CONSULTATION_TIME_EXCEEDED", async () => {

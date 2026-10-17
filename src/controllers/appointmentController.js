@@ -4,8 +4,17 @@ const mongoose = require("mongoose");
 const crypto = require("crypto");
 const { notifyAppointmentEvent } = require("../config/socket");
 const { createNotification } = require("../services/notificationService");
-const { compareAppointmentsDesc, parseTimeSlotToMinutes } = require("../utils/appointmentSorting");
-const { getConsultationWindowState } = require("../utils/consultationWindow");
+const {
+  compareAppointmentsDesc,
+  compareAppointmentsAsc,
+  sortAppointmentsDesc,
+  sortUpcomingAppointments,
+  sortPastAppointments,
+  partitionAppointments,
+  parseTimeSlotToMinutes,
+} = require("../utils/appointmentSorting");
+const { getConsultationWindowState, isAppointmentExpired } = require("../utils/consultationWindow");
+const { expireStaleAppointments } = require("../services/appointmentExpiryService");
 
 const isDbConnected = () => mongoose.connection.readyState === 1;
 
@@ -631,6 +640,19 @@ const getAppointments = async (req, res) => {
       });
     }
 
+    // Idempotently evaluate and expire any stale video appointments for this scope
+    try {
+      await expireStaleAppointments(
+        req.user.role === "doctor"
+          ? { doctorId: userIdObj }
+          : req.user.role === "patient"
+          ? { patientId: userIdObj }
+          : {}
+      );
+    } catch (expErr) {
+      console.warn("Lazy expiry warning in getAppointments:", expErr.message);
+    }
+
     const appointments = await Appointment.find(query)
       .populate("patientId", "name email phoneNumber address")
       .populate("doctorId", "name specialization qualifications consultationFee")
@@ -669,10 +691,15 @@ const getAppointments = async (req, res) => {
     // Strictly sort in descending order: latest appointment date and time first
     enrichedAppointments.sort(compareAppointmentsDesc);
 
+    // Also partition into upcoming (nearest first) and past (most recent first)
+    const partitioned = partitionAppointments(enrichedAppointments);
+
     return res.status(200).json({
       success: true,
       count: enrichedAppointments.length,
       appointments: enrichedAppointments,
+      upcomingAppointments: partitioned.upcoming,
+      pastAppointments: partitioned.past,
     });
   } catch (error) {
     console.error("Get Appointments Error:", error);
@@ -705,6 +732,12 @@ const getAppointmentById = async (req, res) => {
         success: false,
         message: "Appointment not found.",
       });
+    }
+
+    // Lazy evaluation for video appointment expiration
+    if (isAppointmentExpired(appointment)) {
+      appointment.status = "Expired";
+      await appointment.save();
     }
 
     // Access control: only the patient, assigned doctor, or admin
@@ -796,10 +829,10 @@ const updateAppointment = async (req, res) => {
     const requestedStatusNorm = status ? normalizeStatus(status) : null;
     const currentStatusNorm = normalizeStatus(appointment.status);
 
-    // Doctor actions: Confirm, Complete, Reject, Cancel
+    // Doctor actions: Confirm, Complete, Reject, Cancel, Expire
     if (isDoctorOwner || isAdmin) {
       if (status) {
-        if (!["Scheduled", "Confirmed", "In Progress", "Completed", "Cancelled", "Rejected"].includes(status)) {
+        if (!["Scheduled", "Confirmed", "In Progress", "Completed", "Cancelled", "Rejected", "Expired"].includes(status)) {
           return res.status(400).json({
             success: false,
             message: "Invalid appointment status value.",
@@ -814,58 +847,81 @@ const updateAppointment = async (req, res) => {
           });
         }
 
+        // Doctor cannot cancel or reject an appointment that has already expired
+        if (currentStatusNorm === "EXPIRED" && (requestedStatusNorm === "CANCELLED" || requestedStatusNorm === "REJECTED")) {
+          return res.status(400).json({
+            success: false,
+            message: "Cannot cancel or reject an appointment that has already expired.",
+          });
+        }
+
         appointment.status = status;
       }
       if (rejectionReason) appointment.rejectionReason = rejectionReason.trim();
     }
 
-    // Patient actions: Reschedule or Cancel
+    // Patient actions: Reschedule or Cancel, or start In Progress
     if (isPatientOwner && !isDoctorOwner && !isAdmin) {
       if (status) {
-        if (requestedStatusNorm !== "CANCELLED") {
+        if (requestedStatusNorm === "IN PROGRESS") {
+          if (["COMPLETED", "CANCELLED", "REJECTED", "EXPIRED"].includes(currentStatusNorm)) {
+            return res.status(400).json({
+              success: false,
+              message: `Cannot start consultation for an appointment that is already ${appointment.status.toLowerCase()}.`,
+            });
+          }
+          appointment.status = "In Progress";
+        } else if (requestedStatusNorm !== "CANCELLED") {
           return res.status(403).json({
             success: false,
             message: "Patients are only authorized to cancel their own appointments.",
           });
-        }
+        } else {
+          // Validate current status before allowing cancellation
+          if (currentStatusNorm === "COMPLETED") {
+            return res.status(400).json({
+              success: false,
+              message: "Cannot cancel an appointment that has already been completed.",
+            });
+          }
 
-        // Validate current status before allowing cancellation
-        if (currentStatusNorm === "COMPLETED") {
-          return res.status(400).json({
-            success: false,
-            message: "Cannot cancel an appointment that has already been completed.",
-          });
-        }
+          if (currentStatusNorm === "CANCELLED") {
+            return res.status(400).json({
+              success: false,
+              message: "Appointment is already cancelled.",
+            });
+          }
 
-        if (currentStatusNorm === "CANCELLED") {
-          return res.status(400).json({
-            success: false,
-            message: "Appointment is already cancelled.",
-          });
-        }
+          if (currentStatusNorm === "REJECTED") {
+            return res.status(400).json({
+              success: false,
+              message: "Cannot cancel an appointment that has been rejected.",
+            });
+          }
 
-        if (currentStatusNorm === "REJECTED") {
-          return res.status(400).json({
-            success: false,
-            message: "Cannot cancel an appointment that has been rejected.",
-          });
-        }
+          if (currentStatusNorm === "EXPIRED") {
+            return res.status(400).json({
+              success: false,
+              message: "Cannot cancel an appointment that has already expired.",
+            });
+          }
 
-        // Validate date/time: cannot cancel past appointments
-        if (isAppointmentInPast(appointment)) {
-          return res.status(400).json({
-            success: false,
-            message: "Cannot cancel past appointments. Only eligible future appointments can be cancelled.",
-          });
-        }
+          // Validate date/time: cannot cancel past appointments
+          if (isAppointmentInPast(appointment)) {
+            return res.status(400).json({
+              success: false,
+              message: "Cannot cancel past appointments. Only eligible future appointments can be cancelled.",
+            });
+          }
 
-        appointment.status = "Cancelled";
-        if (cancellationReason) appointment.cancellationReason = cancellationReason.trim();
+          appointment.status = "Cancelled";
+          if (cancellationReason) appointment.cancellationReason = cancellationReason.trim();
+        }
       }
 
       // If rescheduling date or timeSlot
       if (appointmentDate || timeSlot) {
-        if (currentStatusNorm === "COMPLETED" || currentStatusNorm === "CANCELLED" || currentStatusNorm === "REJECTED") {
+        if (["COMPLETED", "CANCELLED", "REJECTED", "EXPIRED"].includes(currentStatusNorm)) {
           return res.status(400).json({
             success: false,
             message: `Cannot reschedule an appointment that is already ${appointment.status.toLowerCase()}.`,
@@ -1200,7 +1256,7 @@ const getVideoAccess = async (req, res) => {
       return res.status(400).json({
         success: false,
         error: "CONSULTATION_NOT_STARTED",
-        message: `Consultation has not started yet. Starts at ${windowState.formattedTime}.`,
+        message: `Consultation has not started yet. Consultation starts at ${windowState.formattedTime}.`,
         startTime: windowState.startTimeMs,
         deadline: windowState.deadlineMs,
         timeSlot: appointment.timeSlot,
@@ -1208,6 +1264,11 @@ const getVideoAccess = async (req, res) => {
     }
 
     if (windowState.status === "EXPIRED") {
+      // Lazy persist to Expired status in database if not already persisted
+      if (appointment.status !== "Expired") {
+        appointment.status = "Expired";
+        await appointment.save();
+      }
       return res.status(400).json({
         success: false,
         error: "CONSULTATION_TIME_EXCEEDED",

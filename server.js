@@ -4,6 +4,10 @@ const http = require("http");
 const connectDB = require("./src/config/db");
 const app = require("./src/app");
 const { initSocket } = require("./src/config/socket");
+const {
+  startAppointmentExpiryCron,
+  stopAppointmentExpiryCron,
+} = require("./src/services/appointmentExpiryService");
 
 connectDB();
 
@@ -12,6 +16,9 @@ const server = http.createServer(app);
 
 // Initialize real-time Socket.IO server
 initSocket(server);
+
+// Start automatic appointment status & consultation expiry worker
+startAppointmentExpiryCron(60000);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT} (0.0.0.0)`);
@@ -23,6 +30,7 @@ const handleShutdown = async (signal) => {
   server.close(async () => {
     console.log("✅ HTTP server closed.");
     try {
+      stopAppointmentExpiryCron();
       const { disconnectDB } = require("./src/config/db");
       await disconnectDB();
     } catch (e) {

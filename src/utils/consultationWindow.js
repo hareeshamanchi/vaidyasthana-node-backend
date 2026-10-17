@@ -10,7 +10,34 @@
  * - In-Person appointments: Video button not applicable.
  */
 
-const { parseTimeSlotToMinutes } = require("./appointmentSorting");
+/**
+ * Parses a time slot string into minutes from midnight (0 - 1439).
+ */
+const parseTimeSlotToMinutes = (timeSlot) => {
+  if (!timeSlot || typeof timeSlot !== "string") return -1;
+  const startPart = timeSlot.split("-")[0].trim();
+
+  // Match 12-hour format: "4:30 PM", "04:30 PM", "11:30 AM"
+  const match12 = startPart.match(/^(\d{1,2}):(\d{2})\s*(AM|PM)$/i);
+  if (match12) {
+    let hours = parseInt(match12[1], 10);
+    const minutes = parseInt(match12[2], 10);
+    const modifier = match12[3].toUpperCase();
+    if (modifier === "PM" && hours < 12) hours += 12;
+    if (modifier === "AM" && hours === 12) hours = 0;
+    return hours * 60 + minutes;
+  }
+
+  // Match 24-hour format: "16:30", "09:00"
+  const match24 = startPart.match(/^(\d{1,2}):(\d{2})$/);
+  if (match24) {
+    const hours = parseInt(match24[1], 10);
+    const minutes = parseInt(match24[2], 10);
+    return hours * 60 + minutes;
+  }
+
+  return -1;
+};
 
 const GRACE_PERIOD_MS = 30 * 60 * 1000; // 30 minutes
 
@@ -167,7 +194,7 @@ const getConsultationWindowState = (appointment, now = Date.now()) => {
     };
   }
 
-  // 2. Lifecycle Status checks (Never joinable if Cancelled, Rejected, Completed)
+  // 2. Lifecycle Status checks (Never joinable if Cancelled, Rejected, Completed, or Expired)
   const statusNorm = normalizeStatus(appointment.status);
   if (statusNorm === "CANCELLED") {
     return {
@@ -211,6 +238,39 @@ const getConsultationWindowState = (appointment, now = Date.now()) => {
     };
   }
 
+  if (statusNorm === "EXPIRED") {
+    return {
+      isEligibleMode: true,
+      status: "EXPIRED",
+      canJoin: false,
+      buttonText: "Consultation Time Exceeded",
+      badgeText: "Expired",
+      startTimeMs: null,
+      deadlineMs: null,
+      remainingMs: 0,
+      formattedTime: "",
+    };
+  }
+
+  // Active call in progress (never disconnect solely because joining grace period ended)
+  if (statusNorm === "IN PROGRESS" || statusNorm === "IN_PROGRESS") {
+    const timing = getAppointmentStartAndDeadline(
+      appointment.appointmentDate,
+      appointment.timeSlot || appointment.startTime
+    );
+    return {
+      isEligibleMode: true,
+      status: "IN_PROGRESS",
+      canJoin: true,
+      buttonText: "Join Video Consultation",
+      badgeText: "In Progress",
+      startTimeMs: timing?.startTimeMs || null,
+      deadlineMs: timing?.deadlineMs || null,
+      remainingMs: timing?.deadlineMs ? Math.max(0, timing.deadlineMs - now) : 0,
+      formattedTime: timing?.formattedTime || "",
+    };
+  }
+
   // 3. Time Window calculation
   const timing = getAppointmentStartAndDeadline(
     appointment.appointmentDate,
@@ -239,7 +299,7 @@ const getConsultationWindowState = (appointment, now = Date.now()) => {
       isEligibleMode: true,
       status: "BEFORE_START",
       canJoin: false,
-      buttonText: `Starts at ${formattedTime}`,
+      buttonText: `Consultation starts at ${formattedTime}`,
       badgeText: "Upcoming",
       startTimeMs,
       deadlineMs,
@@ -277,11 +337,42 @@ const getConsultationWindowState = (appointment, now = Date.now()) => {
   };
 };
 
+/**
+ * Evaluates whether a video appointment is eligible for automatic expiration.
+ * Strictly returns true ONLY if:
+ * 1. Appointment is a video/online consultation mode.
+ * 2. Current status is "Scheduled" or "Confirmed" (never Completed, Cancelled, Rejected, or In Progress).
+ * 3. The current time has strictly passed the 30-minute grace period deadline (now > deadlineMs).
+ *
+ * @param {Object} appointment
+ * @param {number} [now=Date.now()]
+ * @returns {boolean}
+ */
+const isAppointmentExpired = (appointment, now = Date.now()) => {
+  if (!appointment) return false;
+  if (!isVideoConsultationMode(appointment.consultationType)) return false;
+
+  const statusNorm = normalizeStatus(appointment.status);
+  if (statusNorm !== "SCHEDULED" && statusNorm !== "CONFIRMED") {
+    return false;
+  }
+
+  const timing = getAppointmentStartAndDeadline(
+    appointment.appointmentDate,
+    appointment.timeSlot || appointment.startTime
+  );
+  if (!timing || !timing.deadlineMs) return false;
+
+  return now > timing.deadlineMs;
+};
+
 module.exports = {
   GRACE_PERIOD_MS,
   normalizeStatus,
   isVideoConsultationMode,
   getAppointmentStartAndDeadline,
   getConsultationWindowState,
+  isAppointmentExpired,
   formatMinutesTo12Hour,
+  parseTimeSlotToMinutes,
 };
