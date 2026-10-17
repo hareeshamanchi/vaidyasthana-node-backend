@@ -6,6 +6,26 @@ const reportSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       required: true,
+      index: true,
+    },
+
+    uploadedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+      index: true,
+    },
+
+    uploadedByRole: {
+      type: String,
+      enum: ["patient", "doctor", "admin"],
+      default: "patient",
+    },
+
+    uploaderName: {
+      type: String,
+      default: "",
+      trim: true,
     },
 
     fileName: {
@@ -16,6 +36,7 @@ const reportSchema = new mongoose.Schema(
     originalName: {
       type: String,
       required: true,
+      trim: true,
     },
 
     blobUrl: {
@@ -41,10 +62,16 @@ const reportSchema = new mongoose.Schema(
     category: {
       type: String,
       default: "Medical Report",
+      trim: true,
+    },
+
+    notes: {
+      type: String,
+      default: "",
     },
 
     // ==================================
-    // OCR DATA
+    // OCR DATA (Document Intelligence)
     // ==================================
 
     ocrText: {
@@ -73,7 +100,7 @@ const reportSchema = new mongoose.Schema(
     },
 
     // ==================================
-    // AI ANALYSIS
+    // AI ANALYSIS (Azure OpenAI)
     // ==================================
 
     aiAnalysis: {
@@ -84,6 +111,7 @@ const reportSchema = new mongoose.Schema(
 
       severity: {
         type: String,
+        enum: ["Low", "Medium", "High", "Critical", "Unknown"],
         default: "Unknown",
       },
 
@@ -146,6 +174,12 @@ const reportSchema = new mongoose.Schema(
         default: [],
       },
 
+      disclaimer: {
+        type: String,
+        default:
+          "Medical Disclaimer: This AI-assisted analysis is for informational educational purposes only. It is not a clinical diagnosis. Always consult a qualified medical professional.",
+      },
+
       generatedAt: {
         type: Date,
         default: null,
@@ -158,13 +192,32 @@ const reportSchema = new mongoose.Schema(
 
     analysisStatus: {
       type: String,
+      enum: ["Pending", "Processing", "Completed", "Failed"],
+      default: "Pending",
+    },
+
+    processingStage: {
+      type: String,
       enum: [
-        "Pending",
-        "Processing",
-        "Completed",
+        "Preparing your report",
+        "Uploading your medical report",
+        "Extracting text from your document",
+        "AI is analyzing your report",
+        "Saving your analysis",
+        "Analysis complete",
         "Failed",
       ],
-      default: "Pending",
+      default: "Preparing your report",
+    },
+
+    errorMessage: {
+      type: String,
+      default: "",
+    },
+
+    timings: {
+      type: Object,
+      default: {},
     },
 
     uploadedAt: {
@@ -176,5 +229,7 @@ const reportSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+reportSchema.index({ userId: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Report", reportSchema);

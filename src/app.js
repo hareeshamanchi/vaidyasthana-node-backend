@@ -1,8 +1,18 @@
 const express = require("express");
 const cors = require("cors");
+const cookieParser = require("cookie-parser");
 
 const authRoutes = require("./routes/authRoutes");
 const uploadRoutes = require("./routes/uploadRoutes");
+const appointmentRoutes = require("./routes/appointmentRoutes");
+const insuranceRoutes = require("./routes/insuranceRoutes");
+const contactRoutes = require("./routes/contactRoutes");
+const doctorRoutes = require("./routes/doctorRoutes");
+const healthRoutes = require("./routes/healthRoutes");
+const adminRoutes = require("./routes/adminRoutes");
+const nutritionRoutes = require("./routes/nutritionRoutes");
+const notificationRoutes = require("./routes/notificationRoutes");
+const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
 
@@ -11,40 +21,86 @@ const app = express();
 | CORS Configuration
 |--------------------------------------------------------------------------
 */
+const allowedOrigins = [
+  process.env.FRONTEND_URL,
+  process.env.CLIENT_URL,
+  "http://localhost:3000",
+  "http://127.0.0.1:3000",
+  "https://vaidyasthana-frontend.onrender.com",
+].filter(Boolean);
 
 app.use(
   cors({
-    origin: process.env.FRONTEND_URL,
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, or server-to-server)
+      if (!origin) return callback(null, true);
+      if (
+        allowedOrigins.includes(origin) ||
+        origin.startsWith("http://localhost:") ||
+        origin.endsWith(".trycloudflare.com") ||
+        origin.endsWith(".vercel.app") ||
+        origin.endsWith(".onrender.com")
+      ) {
+        return callback(null, true);
+      }
+      return callback(null, true); // Permissive for local dev & preview deployments
+    },
     credentials: true,
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
   })
 );
 
 /*
 |--------------------------------------------------------------------------
-| Body Parser
+| Body Parsers & Cookie Parser
 |--------------------------------------------------------------------------
 */
-
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(express.json({ limit: "15mb" }));
+app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 
 /*
 |--------------------------------------------------------------------------
 | API Routes
 |--------------------------------------------------------------------------
 */
-
 app.use("/api/auth", authRoutes);
 app.use("/upload", uploadRoutes);
+app.use("/api/reports", uploadRoutes);
+app.use("/api/appointments", appointmentRoutes);
+app.use("/api/insurance", insuranceRoutes);
+app.use("/api/contact", contactRoutes);
+app.use("/doctor", doctorRoutes);
+app.use("/api/doctor", doctorRoutes);
+app.use("/api/admin", adminRoutes);
+app.use("/api/health", healthRoutes);
+app.use("/api/nutrition", nutritionRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 /*
 |--------------------------------------------------------------------------
 | Home Route
 |--------------------------------------------------------------------------
 */
-
 app.get("/", (req, res) => {
-  res.send("Vaidyasthana Backend Running");
+  res.status(200).json({
+    name: "Vaidyasthana Healthcare Platform API",
+    version: "1.0.0",
+    status: "online",
+    endpoints: {
+      auth: "/api/auth",
+      reports: "/api/reports",
+      upload: "/upload",
+      appointments: "/api/appointments",
+      insurance: "/api/insurance",
+      contact: "/api/contact",
+      doctor: "/api/doctor",
+      admin: "/api/admin",
+      health: "/api/health",
+      nutrition: "/api/nutrition",
+    },
+  });
 });
 
 /*
@@ -52,27 +108,18 @@ app.get("/", (req, res) => {
 | 404 Route
 |--------------------------------------------------------------------------
 */
-
 app.use((req, res) => {
   res.status(404).json({
     success: false,
-    message: "API Route Not Found",
+    message: `API endpoint '${req.originalUrl}' not found.`,
   });
 });
 
 /*
 |--------------------------------------------------------------------------
-| Error Handler
+| Centralized Error Handler
 |--------------------------------------------------------------------------
 */
-
-app.use((err, req, res, next) => {
-  console.error(err);
-
-  res.status(500).json({
-    success: false,
-    message: "Internal Server Error",
-  });
-});
+app.use(errorHandler);
 
 module.exports = app;

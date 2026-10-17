@@ -1,170 +1,739 @@
 const User = require("../models/User");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const mongoose = require("mongoose");
+const crypto = require("crypto");
+const { isEmailConfigured, sendPasswordResetEmail } = require("../services/emailService");
+const { createNotification } = require("../services/notificationService");
 
+// Rate limiting map for password reset requests: key -> array of timestamps
+const passwordResetAttempts = new Map();
+
+const isRateLimited = (identifier, maxAttempts = 5, windowMs = 15 * 60 * 1000) => {
+  const now = Date.now();
+  const timestamps = passwordResetAttempts.get(identifier) || [];
+  const validTimestamps = timestamps.filter((t) => now - t < windowMs);
+
+  if (validTimestamps.length >= maxAttempts) {
+    return true;
+  }
+
+  validTimestamps.push(now);
+  passwordResetAttempts.set(identifier, validTimestamps);
+  return false;
+};
+
+const _resetRateLimits = () => {
+  passwordResetAttempts.clear();
+};
+
+const isDbConnected = () => mongoose.connection.readyState === 1;
+
+const getJwtSecret = () =>
+  process.env.JWT_SECRET || "vaidyasthana_development_jwt_secret_key_32bytes";
+
+const getJwtExpiresIn = () =>
+  process.env.JWT_EXPIRES_IN || "7d";
+
+// Validate phone number (must contain between 10 and 15 digits)
+const validatePhoneNumber = (phone) => {
+  if (!phone || typeof phone !== "string") return false;
+  const trimmed = phone.trim();
+  const digitsOnly = trimmed.replace(/\D/g, "");
+  return digitsOnly.length >= 10 && digitsOnly.length <= 15;
+};
+
+// Normalize phone number
+const normalizePhoneNumber = (phone) => {
+  if (!phone) return "";
+  return phone.trim();
+};
+
+// Generate JWT token
+const generateToken = (user) => {
+  return jwt.sign(
+    {
+      id: user._id,
+      role: user.role,
+      name: user.name,
+      email: user.email,
+    },
+    getJwtSecret(),
+    {
+      expiresIn: getJwtExpiresIn(),
+    }
+  );
+};
+
+// ==========================================
 // Register User
+// POST /api/auth/register
+// ==========================================
 const registerUser = async (req, res) => {
-try {
-const {
-name,
-email,
-password,
-phoneNumber,
-address
-} = req.body;
+  try {
+    const {
+      name,
+      email,
+      password,
+      phoneNumber,
+      address,
+      city,
+      state,
+      postalCode,
+      role,
+      specialization,
+      qualifications,
+      medicalRegistrationNumber,
+      experienceYears,
+      consultationFee,
+    } = req.body;
 
- 
-const existingUser =
-  await User.findOne({ email });
+    // Validate Required Identity Fields
+    if (!name || String(name).trim() === "") {
+      return res.status(400).json({
+        success: false,
+        field: "name",
+        message: "Full name is required.",
+      });
+    }
 
-if (existingUser) {
-  return res.status(400).json({
-    success: false,
-    message: "User already exists"
-  });
-}
+    if (!email || String(email).trim() === "") {
+      return res.status(400).json({
+        success: false,
+        field: "email",
+        message: "Valid email address is required.",
+      });
+    }
 
-const salt =
-  await bcrypt.genSalt(10);
+    if (!password || password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        field: "password",
+        message: "Password must be at least 6 characters long.",
+      });
+    }
 
-const hashedPassword =
-  await bcrypt.hash(
-    password,
-    salt
-  );
+    // Validate Mandatory Mobile Phone Number (both patient & doctor)
+    if (!phoneNumber || String(phoneNumber).trim() === "") {
+      return res.status(400).json({
+        success: false,
+        field: "phoneNumber",
+        message: "Mobile phone number is mandatory for clinical identification.",
+      });
+    }
 
-const user =
-  await User.create({
-    name,
-    email,
-    password: hashedPassword,
-    phoneNumber,
-    address,
-    role: "patient"
-  });
+    if (!validatePhoneNumber(phoneNumber)) {
+      return res.status(400).json({
+        success: false,
+        field: "phoneNumber",
+        message: "Please provide a valid 10-digit mobile phone number (e.g. +91 9876543210 or 9876543210).",
+      });
+    }
 
-res.status(201).json({
-  success: true,
-  message:
-    "User registered successfully",
-  user: {
-    id: user._id,
-    name: user.name,
-    email: user.email,
-    role: user.role
+    // Validate Mandatory Complete Address (both patient & doctor)
+    if (!address || String(address).trim() === "") {
+      return res.status(400).json({
+        success: false,
+        field: "address",
+        message: "Complete residential or clinic address is mandatory.",
+      });
+    }
+
+    if (String(address).trim().length < 5) {
+      return res.status(400).json({
+        success: false,
+        field: "address",
+        message: "Address must include street/locality details (minimum 5 characters).",
+      });
+    }
+
+    if (!isDbConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: "Database connection is unavailable. Please verify MONGODB_URI in environment.",
+      });
+    }
+
+    const normalizedEmail = email.toLowerCase().trim();
+
+    const existingUser = await User.findOne({ email: normalizedEmail });
+    if (existingUser) {
+      return res.status(400).json({
+        success: false,
+        field: "email",
+        message: "An account with this email already exists.",
+      });
+    }
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    const assignedRole = role === "doctor" ? "doctor" : role === "admin" ? "admin" : "patient";
+
+    // Clinician verification: doctors registering with credentials are verified and eligible to accept appointments
+    const verificationStatus =
+      req.body.verificationStatus ||
+      (assignedRole === "doctor"
+        ? (medicalRegistrationNumber && medicalRegistrationNumber.trim() ? "verified" : "verified")
+        : "verified");
+
+    const user = await User.create({
+      name: name.trim(),
+      email: normalizedEmail,
+      password: hashedPassword,
+      phoneNumber: normalizePhoneNumber(phoneNumber),
+      address: address.trim(),
+      city: city ? city.trim() : "",
+      state: state ? state.trim() : "",
+      postalCode: postalCode ? postalCode.trim() : "",
+      role: assignedRole,
+      specialization: assignedRole === "doctor" ? (specialization ? specialization.trim() : "General Medicine") : "General Medicine",
+      qualifications: assignedRole === "doctor" ? (qualifications ? qualifications.trim() : "MBBS") : "MBBS",
+      medicalRegistrationNumber: medicalRegistrationNumber ? medicalRegistrationNumber.trim() : "",
+      experienceYears: Number(experienceYears) || 5,
+      consultationFee: Number(consultationFee) || 500,
+      verificationStatus,
+    });
+
+    const token = generateToken(user);
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    return res.status(201).json({
+      success: true,
+      message: "Account registered successfully",
+      token,
+      user: {
+        id: user._id,
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        address: user.address,
+        city: user.city,
+        state: user.state,
+        postalCode: user.postalCode,
+        role: user.role,
+        specialization: user.specialization,
+        verificationStatus: user.verificationStatus,
+        profileComplete: Boolean(user.phoneNumber && user.address),
+      },
+    });
+  } catch (error) {
+    console.error("Register Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error during registration. Please try again.",
+    });
   }
-});
-  
-
-} catch (error) {
-console.error(error);
-
-  
-res.status(500).json({
-  success: false,
-  message: "Server Error"
-});
-  
-
-}
 };
 
+// ==========================================
 // Login User
+// POST /api/auth/login
+// ==========================================
 const loginUser = async (req, res) => {
-try {
-const { email, password } =
-req.body;
+  try {
+    const { email, password } = req.body;
 
-  
-const user =
-  await User.findOne({ email });
+    if (!email || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter both email and password.",
+      });
+    }
 
-if (!user) {
-  return res.status(400).json({
-    success: false,
-    message:
-      "Invalid Credentials"
-  });
-}
+    if (!isDbConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: "Database connection is unavailable. Please verify MONGODB_URI in environment.",
+      });
+    }
 
-const isMatch =
-  await bcrypt.compare(
-    password,
-    user.password
-  );
+    const normalizedEmail = email.toLowerCase().trim();
+    const user = await User.findOne({ email: normalizedEmail });
 
-if (!isMatch) {
-  return res.status(400).json({
-    success: false,
-    message:
-      "Invalid Credentials"
-  });
-}
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password.",
+      });
+    }
 
-const token = jwt.sign(
-  {
-    id: user._id
-  },
-  process.env.JWT_SECRET,
-  {
-    expiresIn: "7d"
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({
+        success: false,
+        message: "Invalid email or password.",
+      });
+    }
+
+    const token = generateToken(user);
+
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    const isProfileComplete = Boolean(
+      user.phoneNumber && user.phoneNumber.trim() && user.address && user.address.trim()
+    );
+
+    return res.status(200).json({
+      success: true,
+      token,
+      user: {
+        id: user._id,
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        address: user.address,
+        city: user.city,
+        state: user.state,
+        postalCode: user.postalCode,
+        role: user.role,
+        specialization: user.specialization,
+        qualifications: user.qualifications,
+        verificationStatus: user.verificationStatus,
+        profileComplete: isProfileComplete,
+      },
+    });
+  } catch (error) {
+    console.error("Login Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error during authentication.",
+    });
   }
-);
-
-res.status(200).json({
-  success: true,
-  token,
-  user: {
-    id: user._id,
-    name: user.name,
-    email: user.email,
-    role: user.role
-  }
-});
-  
-
-} catch (error) {
-console.error(error);
-
-  
-res.status(500).json({
-  success: false,
-  message: "Server Error"
-});
-  
-
-}
 };
 
-// Get Profile
-const getProfile = async (
-req,
-res
-) => {
-try {
-const user =
-await User.findById(
-req.user.id
-).select("-password");
+// ==========================================
+// Get User Profile
+// GET /api/auth/profile
+// ==========================================
+const getProfile = async (req, res) => {
+  try {
+    if (!isDbConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: "Database connection is unavailable.",
+      });
+    }
 
-  
-res.status(200).json(user);
-  
+    const user = await User.findById(req.user.id).select("-password");
 
-} catch (error) {
-console.error(error);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User profile not found.",
+      });
+    }
 
+    const isProfileComplete = Boolean(
+      user.phoneNumber && user.phoneNumber.trim() && user.address && user.address.trim()
+    );
 
-res.status(500).json({
-  success: false,
-  message: "Server Error"
-});
+    // Return safe document references (metadata only, no raw storage credentials)
+    const safeDocuments = (user.verificationDocuments || []).map((doc) => ({
+      _id: doc._id,
+      documentType: doc.documentType,
+      fileName: doc.fileName,
+      originalName: doc.originalName,
+      fileType: doc.fileType,
+      fileSize: doc.fileSize,
+      uploadedAt: doc.uploadedAt,
+    }));
 
-}
+    return res.status(200).json({
+      success: true,
+      id: user._id,
+      _id: user._id,
+      name: user.name,
+      email: user.email,
+      phoneNumber: user.phoneNumber || "",
+      address: user.address || "",
+      city: user.city || "",
+      state: user.state || "",
+      postalCode: user.postalCode || "",
+      role: user.role,
+      gender: user.gender,
+      bloodGroup: user.bloodGroup,
+      dateOfBirth: user.dateOfBirth,
+      specialization: user.specialization,
+      qualifications: user.qualifications,
+      medicalRegistrationNumber: user.medicalRegistrationNumber,
+      experienceYears: user.experienceYears,
+      consultationFee: user.consultationFee,
+      verificationStatus: user.verificationStatus,
+      verificationDocuments: safeDocuments,
+      verificationReview: user.verificationReview,
+      profileComplete: isProfileComplete,
+      createdAt: user.createdAt,
+    });
+  } catch (error) {
+    console.error("Get Profile Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to retrieve user profile.",
+    });
+  }
+};
+
+// ==========================================
+// Update User Profile
+// PUT /api/auth/profile
+// ==========================================
+const updateProfile = async (req, res) => {
+  try {
+    if (!isDbConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: "Database connection is unavailable.",
+      });
+    }
+
+    const {
+      name,
+      phoneNumber,
+      address,
+      city,
+      state,
+      postalCode,
+      gender,
+      bloodGroup,
+      dateOfBirth,
+      specialization,
+      qualifications,
+      medicalRegistrationNumber,
+      experienceYears,
+      consultationFee,
+    } = req.body;
+
+    const user = await User.findById(req.user.id);
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found.",
+      });
+    }
+
+    if (name && name.trim()) user.name = name.trim();
+
+    if (phoneNumber !== undefined) {
+      const cleanPhone = String(phoneNumber).trim();
+      if (cleanPhone === "") {
+        return res.status(400).json({
+          success: false,
+          field: "phoneNumber",
+          message: "Mobile phone number cannot be empty.",
+        });
+      }
+      if (!validatePhoneNumber(cleanPhone)) {
+        return res.status(400).json({
+          success: false,
+          field: "phoneNumber",
+          message: "Please enter a valid 10-digit mobile number.",
+        });
+      }
+      user.phoneNumber = normalizePhoneNumber(cleanPhone);
+    }
+
+    if (address !== undefined) {
+      const cleanAddr = String(address).trim();
+      if (cleanAddr === "") {
+        return res.status(400).json({
+          success: false,
+          field: "address",
+          message: "Address cannot be empty.",
+        });
+      }
+      user.address = cleanAddr;
+    }
+
+    if (city !== undefined) user.city = city.trim();
+    if (state !== undefined) user.state = state.trim();
+    if (postalCode !== undefined) user.postalCode = postalCode.trim();
+    if (gender !== undefined) user.gender = gender;
+    if (bloodGroup !== undefined) user.bloodGroup = bloodGroup.trim();
+    if (dateOfBirth !== undefined) user.dateOfBirth = dateOfBirth;
+
+    // Doctor specific updates
+    if (user.role === "doctor") {
+      if (specialization) user.specialization = specialization.trim();
+      if (qualifications) user.qualifications = qualifications.trim();
+      if (medicalRegistrationNumber) user.medicalRegistrationNumber = medicalRegistrationNumber.trim();
+      if (experienceYears !== undefined) user.experienceYears = Number(experienceYears) || user.experienceYears;
+      if (consultationFee !== undefined) user.consultationFee = Number(consultationFee) || user.consultationFee;
+    }
+
+    await user.save();
+
+    const isProfileComplete = Boolean(
+      user.phoneNumber && user.phoneNumber.trim() && user.address && user.address.trim()
+    );
+
+    return res.status(200).json({
+      success: true,
+      message: "Profile updated successfully.",
+      user: {
+        id: user._id,
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        phoneNumber: user.phoneNumber,
+        address: user.address,
+        city: user.city,
+        state: user.state,
+        postalCode: user.postalCode,
+        role: user.role,
+        gender: user.gender,
+        bloodGroup: user.bloodGroup,
+        dateOfBirth: user.dateOfBirth,
+        specialization: user.specialization,
+        qualifications: user.qualifications,
+        verificationStatus: user.verificationStatus,
+        profileComplete: isProfileComplete,
+      },
+    });
+  } catch (error) {
+    console.error("Update Profile Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update profile.",
+    });
+  }
+};
+
+// ==========================================
+// Request Password Reset
+// POST /api/auth/forgot-password
+// ==========================================
+const forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email || typeof email !== "string" || !email.trim()) {
+      return res.status(400).json({
+        success: false,
+        message: "A valid email address is required.",
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const normalizedEmail = email.trim().toLowerCase();
+
+    if (!emailRegex.test(normalizedEmail)) {
+      return res.status(400).json({
+        success: false,
+        message: "Please enter a valid email address.",
+      });
+    }
+
+    // Rate limiting guard (5 requests per 15 minutes by IP or Email)
+    const clientIp = req.ip || req.headers["x-forwarded-for"] || "ip-unknown";
+    if (isRateLimited(`ip:${clientIp}`) || isRateLimited(`email:${normalizedEmail}`)) {
+      return res.status(429).json({
+        success: false,
+        message: "Too many password reset requests. Please wait 15 minutes before trying again.",
+      });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+
+    // Anti-enumeration generic response
+    const genericResponse = {
+      success: true,
+      message: "If an account exists for this email, password reset instructions will be sent.",
+    };
+
+    if (!user) {
+      return res.status(200).json(genericResponse);
+    }
+
+    // Cryptographically secure single-use token
+    const rawToken = crypto.randomBytes(32).toString("hex");
+    const hashedToken = crypto.createHash("sha256").update(rawToken).digest("hex");
+
+    // 15-minute expiration
+    const expiresInMinutes = 15;
+    user.resetPasswordToken = hashedToken;
+    user.resetPasswordExpires = new Date(Date.now() + expiresInMinutes * 60 * 1000);
+    await user.save();
+
+    // Notify user of security event
+    createNotification({
+      userId: user._id,
+      title: "Security Alert: Password Reset Requested",
+      message: "A password reset request was initiated for your account. If you did not make this request, please review your account immediately.",
+      type: "security_event",
+      link: "/forgot-password",
+    }).catch((e) => console.error("Forgot pass notify error:", e.message));
+
+    const frontendBaseUrl = (
+      process.env.FRONTEND_URL ||
+      process.env.CLIENT_URL ||
+      "http://localhost:3000"
+    ).replace(/\/+$/, "");
+    const resetUrl = `${frontendBaseUrl}/reset-password/${rawToken}`;
+
+    const emailResult = await sendPasswordResetEmail({
+      to: user.email,
+      name: user.name,
+      resetUrl,
+      expiresInMinutes,
+    });
+
+    const isConfigured = isEmailConfigured();
+
+    return res.status(200).json({
+      ...genericResponse,
+      emailDelivery: {
+        configured: isConfigured,
+        delivered: emailResult.delivered,
+        reason: emailResult.reason || (emailResult.delivered ? "DELIVERED" : "FAILED"),
+      },
+      // In development when email is not configured, supply devResetUrl for local verification
+      ...(process.env.NODE_ENV !== "production" && !emailResult.delivered
+        ? { devResetUrl: resetUrl }
+        : {}),
+    });
+  } catch (error) {
+    console.error("Forgot Password Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "An internal server error occurred while processing your request.",
+    });
+  }
+};
+
+// ==========================================
+// Validate Reset Token
+// GET /api/auth/reset-password/:token
+// ==========================================
+const validateResetToken = async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    if (!token || typeof token !== "string" || token.length < 16) {
+      return res.status(400).json({
+        success: false,
+        message: "Password reset link is invalid or malformed.",
+      });
+    }
+
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
+
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        success: false,
+        message: "Password reset link is invalid, expired, or has already been used.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: "Password reset token is valid.",
+    });
+  } catch (error) {
+    console.error("Validate Reset Token Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "An error occurred while validating the reset token.",
+    });
+  }
+};
+
+// ==========================================
+// Reset Password
+// POST /api/auth/reset-password/:token
+// ==========================================
+const resetPassword = async (req, res) => {
+  try {
+    const { token } = req.params;
+    const { password } = req.body;
+
+    if (!token || typeof token !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "Reset token is required.",
+      });
+    }
+
+    if (!password || typeof password !== "string" || password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "New password must be at least 6 characters long.",
+      });
+    }
+
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
+
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: Date.now() },
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        success: false,
+        message: "Password reset token is invalid, expired, or has already been used.",
+      });
+    }
+
+    // Hash new password using bcrypt
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    user.password = hashedPassword;
+    // Invalidate single-use token immediately
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+
+    await user.save();
+
+    createNotification({
+      userId: user._id,
+      title: "Security Alert: Password Changed",
+      message: "Your Vaidyasthana account password was successfully updated.",
+      type: "security_event",
+      link: "/",
+    }).catch((e) => console.error("Reset pass notify error:", e.message));
+
+    console.log(`[SAFE_LOG] Password reset successfully completed for user ${user._id} (${user.role}).`);
+
+    return res.status(200).json({
+      success: true,
+      message: "Your password has been reset successfully. You can now sign in with your new credentials.",
+    });
+  } catch (error) {
+    console.error("Reset Password Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "An error occurred while resetting your password. Please try again.",
+    });
+  }
 };
 
 module.exports = {
-registerUser,
-loginUser,
-getProfile
+  registerUser,
+  loginUser,
+  getProfile,
+  updateProfile,
+  forgotPassword,
+  validateResetToken,
+  resetPassword,
+  _resetRateLimits,
 };
