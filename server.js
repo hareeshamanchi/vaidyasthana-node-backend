@@ -13,8 +13,8 @@ const server = http.createServer(app);
 // Initialize real-time Socket.IO server
 initSocket(server);
 
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`Server running on port ${PORT} (0.0.0.0)`);
 });
 
 // Graceful shutdown handling

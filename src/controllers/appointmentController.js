@@ -1,6 +1,7 @@
 const Appointment = require("../models/Appointment");
 const User = require("../models/User");
 const mongoose = require("mongoose");
+const crypto = require("crypto");
 const { notifyAppointmentEvent } = require("../config/socket");
 const { createNotification } = require("../services/notificationService");
 const { compareAppointmentsDesc, parseTimeSlotToMinutes } = require("../utils/appointmentSorting");
@@ -1110,6 +1111,137 @@ const deleteAppointment = async (req, res) => {
   }
 };
 
+// ==========================================
+// Authorize & Retrieve Video Consultation Access
+// GET /api/appointments/:id/video-access
+// ==========================================
+const getVideoAccess = async (req, res) => {
+  try {
+    if (!isDbConnected()) {
+      return res.status(503).json({
+        success: false,
+        message: "Database connection is unavailable.",
+      });
+    }
+
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid appointment ID format.",
+      });
+    }
+
+    const appointment = await Appointment.findById(req.params.id)
+      .populate("patientId", "name email phoneNumber")
+      .populate("doctorId", "name specialization qualifications");
+
+    if (!appointment) {
+      return res.status(404).json({
+        success: false,
+        message: "Appointment record not found.",
+      });
+    }
+
+    // Participant verification: strictly the assigned patient or doctor (or platform admin)
+    const patientRefStr = appointment.patientId?._id?.toString() || appointment.patientId?.toString();
+    const doctorRefStr = appointment.doctorId?._id?.toString() || appointment.doctorId?.toString();
+    const userId = req.user.id;
+    const isPatient = patientRefStr === userId;
+    const isDoctor = doctorRefStr === userId;
+    const isAdmin = req.user.role === "admin";
+
+    if (!isPatient && !isDoctor && !isAdmin) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied: You are not an authorized participant for this consultation.",
+      });
+    }
+
+    // Consultation mode verification: must be VIDEO or ONLINE
+    const modeNorm = String(appointment.consultationType || "").trim().toUpperCase();
+    const isVideoMode = modeNorm.includes("VIDEO") || modeNorm.includes("ONLINE");
+    if (!isVideoMode) {
+      return res.status(400).json({
+        success: false,
+        message: `Video consultation is not available for in-person appointments. Consultation mode: ${appointment.consultationType || "In-Person"}.`,
+      });
+    }
+
+    // Status lifecycle check: Cancelled or Rejected cannot start/join call
+    const statusNorm = String(appointment.status || "").trim().toUpperCase();
+    if (statusNorm === "CANCELLED") {
+      return res.status(400).json({
+        success: false,
+        message: "This appointment has been cancelled. Video consultation cannot be started.",
+      });
+    }
+
+    if (statusNorm === "REJECTED") {
+      return res.status(400).json({
+        success: false,
+        message: "This appointment was rejected. Video consultation is unavailable.",
+      });
+    }
+
+    if (statusNorm === "COMPLETED") {
+      return res.status(400).json({
+        success: false,
+        message: "This consultation has already been completed.",
+      });
+    }
+
+    // Cryptographic, non-guessable, appointment-specific room identifier
+    // Generates the exact same room identifier for both doctor and patient
+    let roomName = appointment.meetingRoomId;
+    if (!roomName) {
+      const secret = process.env.JWT_SECRET || "vaidyasthana_secure_video_salt_key";
+      const prefix = process.env.VIDEO_ROOM_PREFIX || "vaidyasthana-consult";
+      const hash = crypto
+        .createHmac("sha256", secret)
+        .update(`appt:${appointment._id.toString()}:${appointment.createdAt ? appointment.createdAt.getTime() : 0}`)
+        .digest("hex")
+        .slice(0, 32);
+      roomName = `${prefix}-${hash}`;
+
+      // Persist to appointment document
+      appointment.meetingRoomId = roomName;
+      await appointment.save().catch((err) =>
+        console.warn("Notice: could not persist meetingRoomId to DB:", err.message)
+      );
+    }
+
+    const jitsiDomain = process.env.JITSI_DOMAIN || "meet.jit.si";
+    const userRole = isDoctor ? "doctor" : isPatient ? "patient" : "admin";
+    const displayName = isDoctor
+      ? (req.user.name?.startsWith("Dr.") ? req.user.name : `Dr. ${req.user.name || "Doctor"}`)
+      : req.user.name || "Patient";
+
+    return res.status(200).json({
+      success: true,
+      meeting: {
+        roomName,
+        domain: jitsiDomain,
+        appointmentId: appointment._id,
+        appointmentDate: appointment.appointmentDate,
+        timeSlot: appointment.timeSlot,
+        consultationType: appointment.consultationType,
+        status: appointment.status,
+        doctorName: appointment.doctorName?.startsWith("Dr.") ? appointment.doctorName : `Dr. ${appointment.doctorName}`,
+        patientName: appointment.patientName,
+        department: appointment.department,
+        userRole,
+        displayName,
+      },
+    });
+  } catch (error) {
+    console.error("Get Video Access Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to authorize video consultation session.",
+    });
+  }
+};
+
 module.exports = {
   getDoctorsDirectory,
   getAvailableSlots,
@@ -1118,4 +1250,5 @@ module.exports = {
   getAppointmentById,
   updateAppointment,
   deleteAppointment,
+  getVideoAccess,
 };
