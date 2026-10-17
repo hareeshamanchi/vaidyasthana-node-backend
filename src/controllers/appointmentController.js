@@ -5,6 +5,7 @@ const crypto = require("crypto");
 const { notifyAppointmentEvent } = require("../config/socket");
 const { createNotification } = require("../services/notificationService");
 const { compareAppointmentsDesc, parseTimeSlotToMinutes } = require("../utils/appointmentSorting");
+const { getConsultationWindowState } = require("../utils/consultationWindow");
 
 const isDbConnected = () => mongoose.connection.readyState === 1;
 
@@ -1157,36 +1158,63 @@ const getVideoAccess = async (req, res) => {
       });
     }
 
-    // Consultation mode verification: must be VIDEO or ONLINE
-    const modeNorm = String(appointment.consultationType || "").trim().toUpperCase();
-    const isVideoMode = modeNorm.includes("VIDEO") || modeNorm.includes("ONLINE");
-    if (!isVideoMode) {
+    // Evaluate consultation window state (mode, lifecycle status, 30-minute grace period)
+    const windowState = getConsultationWindowState(appointment, Date.now());
+
+    // 1. Consultation mode verification: must be VIDEO or ONLINE
+    if (!windowState.isEligibleMode) {
       return res.status(400).json({
         success: false,
+        error: "IN_PERSON_APPOINTMENT",
         message: `Video consultation is not available for in-person appointments. Consultation mode: ${appointment.consultationType || "In-Person"}.`,
       });
     }
 
-    // Status lifecycle check: Cancelled or Rejected cannot start/join call
-    const statusNorm = String(appointment.status || "").trim().toUpperCase();
-    if (statusNorm === "CANCELLED") {
+    // 2. Lifecycle status checks: Cancelled, Rejected, or Completed cannot start/join call
+    if (windowState.status === "CANCELLED") {
       return res.status(400).json({
         success: false,
+        error: "CONSULTATION_CANCELLED",
         message: "This appointment has been cancelled. Video consultation cannot be started.",
       });
     }
 
-    if (statusNorm === "REJECTED") {
+    if (windowState.status === "REJECTED") {
       return res.status(400).json({
         success: false,
+        error: "CONSULTATION_REJECTED",
         message: "This appointment was rejected. Video consultation is unavailable.",
       });
     }
 
-    if (statusNorm === "COMPLETED") {
+    if (windowState.status === "COMPLETED") {
       return res.status(400).json({
         success: false,
+        error: "CONSULTATION_COMPLETED",
         message: "This consultation has already been completed.",
+      });
+    }
+
+    // 3. Time Window Enforcement: Scheduled start time through 30-minute grace period
+    if (windowState.status === "BEFORE_START") {
+      return res.status(400).json({
+        success: false,
+        error: "CONSULTATION_NOT_STARTED",
+        message: `Consultation has not started yet. Starts at ${windowState.formattedTime}.`,
+        startTime: windowState.startTimeMs,
+        deadline: windowState.deadlineMs,
+        timeSlot: appointment.timeSlot,
+      });
+    }
+
+    if (windowState.status === "EXPIRED") {
+      return res.status(400).json({
+        success: false,
+        error: "CONSULTATION_TIME_EXCEEDED",
+        message: "Consultation time exceeded: The 30-minute consultation window for this video appointment has expired.",
+        startTime: windowState.startTimeMs,
+        deadline: windowState.deadlineMs,
+        timeSlot: appointment.timeSlot,
       });
     }
 
@@ -1231,6 +1259,8 @@ const getVideoAccess = async (req, res) => {
         department: appointment.department,
         userRole,
         displayName,
+        startTime: windowState.startTimeMs,
+        deadline: windowState.deadlineMs,
       },
     });
   } catch (error) {

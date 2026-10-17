@@ -25,6 +25,8 @@ let inPersonAppointment;
 let cancelledAppointment;
 let rejectedAppointment;
 let completedAppointment;
+let futureAppointment;
+let expiredAppointment;
 
 const request = async (method, path, body = null, token = null) => {
   const url = `${baseUrl}${path}`;
@@ -147,10 +149,21 @@ describe("Real-Time Video Consultation Access & Security Suite", () => {
       { expiresIn: "1h" }
     );
 
-    const baseDate = new Date();
-    baseDate.setUTCDate(baseDate.getUTCDate() + 1);
+    const now = new Date();
+    const todayUTC = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0));
+    const curMinutes = now.getHours() * 60 + now.getMinutes();
+    const activeStartMin = Math.max(0, curMinutes - 5);
+    const activeHours24 = Math.floor(activeStartMin / 60);
+    const activeMins = activeStartMin % 60;
+    const activeMod = activeHours24 >= 12 ? "PM" : "AM";
+    let activeHours12 = activeHours24 % 12;
+    if (activeHours12 === 0) activeHours12 = 12;
+    const activeSlot = `${String(activeHours12).padStart(2, "0")}:${String(activeMins).padStart(2, "0")} ${activeMod}`;
 
-    // 1. Scheduled Video / Online Appointment
+    const futureDate = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate() + 1, 0, 0, 0, 0));
+    const expiredDate = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0, 0));
+
+    // 1. Scheduled Video / Online Appointment (Currently active within 30-minute window)
     videoAppointment = await Appointment.create({
       patientId: patientUser._id,
       doctorId: doctorUser._id,
@@ -159,63 +172,91 @@ describe("Real-Time Video Consultation Access & Security Suite", () => {
       patientPhone: patientUser.phoneNumber,
       patientEmail: patientUser.email,
       department: "Cardiology",
-      appointmentDate: baseDate,
-      timeSlot: "10:00 AM",
+      appointmentDate: todayUTC,
+      timeSlot: activeSlot,
       consultationType: "Video / Online",
       type: "Consultation",
       reason: "Clinical Telehealth Evaluation",
       status: "Scheduled",
     });
 
-    // 2. Scheduled In-Person Appointment
+    // 2. Future Video Appointment (Not yet started)
+    futureAppointment = await Appointment.create({
+      patientId: patientUser._id,
+      doctorId: doctorUser._id,
+      doctorName: doctorUser.name,
+      patientName: patientUser.name,
+      department: "Cardiology",
+      appointmentDate: futureDate,
+      timeSlot: "10:00 AM",
+      consultationType: "Video / Online",
+      type: "Consultation",
+      status: "Scheduled",
+    });
+
+    // 3. Expired Video Appointment (> 30 minutes past start)
+    expiredAppointment = await Appointment.create({
+      patientId: patientUser._id,
+      doctorId: doctorUser._id,
+      doctorName: doctorUser.name,
+      patientName: patientUser.name,
+      department: "Cardiology",
+      appointmentDate: expiredDate,
+      timeSlot: "10:00 AM",
+      consultationType: "Video / Online",
+      type: "Consultation",
+      status: "Scheduled",
+    });
+
+    // 4. Scheduled In-Person Appointment
     inPersonAppointment = await Appointment.create({
       patientId: patientUser._id,
       doctorId: doctorUser._id,
       doctorName: doctorUser.name,
       patientName: patientUser.name,
       department: "Cardiology",
-      appointmentDate: baseDate,
+      appointmentDate: futureDate,
       timeSlot: "11:00 AM",
       consultationType: "In-Person",
       type: "Consultation",
       status: "Scheduled",
     });
 
-    // 3. Cancelled Video Appointment
+    // 5. Cancelled Video Appointment
     cancelledAppointment = await Appointment.create({
       patientId: patientUser._id,
       doctorId: doctorUser._id,
       doctorName: doctorUser.name,
       patientName: patientUser.name,
       department: "Cardiology",
-      appointmentDate: baseDate,
+      appointmentDate: futureDate,
       timeSlot: "12:00 PM",
       consultationType: "Video / Online",
       status: "Cancelled",
     });
 
-    // 4. Rejected Video Appointment
+    // 6. Rejected Video Appointment
     rejectedAppointment = await Appointment.create({
       patientId: patientUser._id,
       doctorId: doctorUser._id,
       doctorName: doctorUser.name,
       patientName: patientUser.name,
       department: "Cardiology",
-      appointmentDate: baseDate,
+      appointmentDate: futureDate,
       timeSlot: "01:00 PM",
       consultationType: "Video / Online",
       status: "Rejected",
       rejectionReason: "Doctor unavailable at requested time.",
     });
 
-    // 5. Completed Video Appointment
+    // 7. Completed Video Appointment
     completedAppointment = await Appointment.create({
       patientId: patientUser._id,
       doctorId: doctorUser._id,
       doctorName: doctorUser.name,
       patientName: patientUser.name,
       department: "Cardiology",
-      appointmentDate: baseDate,
+      appointmentDate: futureDate,
       timeSlot: "02:00 PM",
       consultationType: "Video / Online",
       status: "Completed",
@@ -230,6 +271,8 @@ describe("Real-Time Video Consultation Access & Security Suite", () => {
     if (unrelatedPatientUser) await User.deleteOne({ _id: unrelatedPatientUser._id });
 
     if (videoAppointment) await Appointment.deleteOne({ _id: videoAppointment._id });
+    if (futureAppointment) await Appointment.deleteOne({ _id: futureAppointment._id });
+    if (expiredAppointment) await Appointment.deleteOne({ _id: expiredAppointment._id });
     if (inPersonAppointment) await Appointment.deleteOne({ _id: inPersonAppointment._id });
     if (cancelledAppointment) await Appointment.deleteOne({ _id: cancelledAppointment._id });
     if (rejectedAppointment) await Appointment.deleteOne({ _id: rejectedAppointment._id });
@@ -328,5 +371,21 @@ describe("Real-Time Video Consultation Access & Security Suite", () => {
     await request("GET", `/api/appointments/${videoAppointment._id}/video-access`, null, doctorToken);
     const freshAppt = await Appointment.findById(videoAppointment._id);
     assert.strictEqual(freshAppt.status, "Scheduled");
+  });
+
+  it("12. Premature join attempt before scheduled start time is rejected with 400 and CONSULTATION_NOT_STARTED", async () => {
+    const res = await request("GET", `/api/appointments/${futureAppointment._id}/video-access`, null, patientToken);
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(res.body.success, false);
+    assert.strictEqual(res.body.error, "CONSULTATION_NOT_STARTED");
+    assert.ok(res.body.message.includes("Starts at"));
+  });
+
+  it("13. Expired join attempt after 30-minute grace period is rejected with 400 and CONSULTATION_TIME_EXCEEDED", async () => {
+    const res = await request("GET", `/api/appointments/${expiredAppointment._id}/video-access`, null, patientToken);
+    assert.strictEqual(res.status, 400);
+    assert.strictEqual(res.body.success, false);
+    assert.strictEqual(res.body.error, "CONSULTATION_TIME_EXCEEDED");
+    assert.ok(res.body.message.includes("Consultation time exceeded"));
   });
 });
