@@ -13,9 +13,13 @@ const mongoose = require("mongoose");
 const Medication = require("../models/Medication");
 const DoseEvent = require("../models/DoseEvent");
 const { createNotification } = require("./notificationService");
+const { sendPushToUser } = require("./pushNotificationService");
+const { getIO } = require("../config/socket");
 
 let reminderWorkerTimer = null;
 const DEFAULT_GRACE_PERIOD_MS = 2 * 60 * 60 * 1000; // 2 hours
+const REPEAT_ALERT_INTERVAL_MS = 90 * 1000; // 90 seconds repeating alerts
+const MAX_REPEAT_ALERTS = 20; // Server-side rate limit cap for repeating alerts
 
 const isDbConnected = () => mongoose.connection && mongoose.connection.readyState === 1;
 
@@ -219,17 +223,23 @@ const evaluateMissedDoses = async (options = {}) => {
 };
 
 /**
- * Checks for due medication reminders and broadcasts real-time notifications.
- * Idempotent: uses atomic reminderSent: true flag to guarantee single dispatch.
+ * Checks for due medication reminders and broadcasts real-time & push notifications.
+ * Handles both:
+ * 1. Initial due dose detection (atomic claim with reminderSent: true)
+ * 2. Repeating due dose alerts every 90 seconds while dose remains Scheduled & pending (up to maxAlerts)
  */
 const processDueReminders = async (options = {}) => {
   if (!isDbConnected()) return [];
 
   const now = options.now || Date.now();
   const nowDate = new Date(now);
+  const repeatIntervalMs = options.repeatIntervalMs || REPEAT_ALERT_INTERVAL_MS;
+  const maxRepeats = options.maxRepeats || MAX_REPEAT_ALERTS;
 
-  // Find Scheduled doses due up to now where reminderSent is false and snooze expired
-  const query = {
+  const dispatchedReminders = [];
+
+  // 1. Initial Due Doses (reminderSent: false)
+  const initialQuery = {
     status: "Scheduled",
     scheduledTime: { $lte: nowDate },
     reminderSent: false,
@@ -237,14 +247,12 @@ const processDueReminders = async (options = {}) => {
   };
 
   if (options.patientId) {
-    query.patientId = options.patientId;
+    initialQuery.patientId = options.patientId;
   }
 
-  const dueDoses = await DoseEvent.find(query);
-  const dispatchedReminders = [];
+  const initialDueDoses = await DoseEvent.find(initialQuery);
 
-  for (const dose of dueDoses) {
-    // Atomically claim this reminder
+  for (const dose of initialDueDoses) {
     const updated = await DoseEvent.findOneAndUpdate(
       {
         _id: dose._id,
@@ -255,7 +263,9 @@ const processDueReminders = async (options = {}) => {
         $set: {
           reminderSent: true,
           reminderSentAt: nowDate,
+          lastAlertAt: nowDate,
         },
+        $inc: { alertCount: 1 },
       },
       { returnDocument: "after" }
     );
@@ -265,16 +275,100 @@ const processDueReminders = async (options = {}) => {
 
       const foodNote = formatFoodTiming(updated.foodTiming);
       const instructionText = updated.instructions ? ` - Note: ${updated.instructions}` : "";
+      const notificationTitle = `Medication Reminder: ${updated.medicationName}`;
+      const notificationMessage = `Time to take ${updated.dosage} ${updated.dosageUnit} of ${updated.medicationName} (${foodNote})${instructionText}.`;
 
+      // 1a. Persistent In-App Notification (and Socket.IO broadcast via notificationService)
       await createNotification({
         userId: updated.patientId,
-        title: `Medication Reminder: ${updated.medicationName}`,
-        message: `Time to take ${updated.dosage} ${updated.dosageUnit} of ${updated.medicationName} (${foodNote})${instructionText}.`,
+        title: notificationTitle,
+        message: notificationMessage,
         type: "medication_reminder",
         relatedId: updated.medicationId,
         relatedModel: "Medication",
         link: "/medications",
       });
+
+      // 1b. Background Web Push (delivered even when browser tab is closed)
+      try {
+        await sendPushToUser(updated.patientId, {
+          title: notificationTitle,
+          body: notificationMessage,
+          tag: "medication-due-reminder",
+          data: { url: "/medications", doseId: updated._id.toString() },
+        });
+      } catch (pushErr) {
+        console.warn("[MEDICATION_REMINDER] Initial push dispatch warning:", pushErr.message);
+      }
+    }
+  }
+
+  // 2. Repeating Pending Doses (every 90 seconds while Scheduled and unacknowledged)
+  const repeatCutoff = new Date(now - repeatIntervalMs);
+  const repeatingQuery = {
+    status: "Scheduled",
+    reminderSent: true,
+    lastAlertAt: { $lte: repeatCutoff },
+    alertCount: { $lt: maxRepeats },
+    $or: [{ snoozeUntil: null }, { snoozeUntil: { $lte: nowDate } }],
+  };
+
+  if (options.patientId) {
+    repeatingQuery.patientId = options.patientId;
+  }
+
+  const repeatingDueDoses = await DoseEvent.find(repeatingQuery);
+
+  for (const dose of repeatingDueDoses) {
+    const updated = await DoseEvent.findOneAndUpdate(
+      {
+        _id: dose._id,
+        status: "Scheduled",
+        lastAlertAt: { $lte: repeatCutoff },
+      },
+      {
+        $set: {
+          lastAlertAt: nowDate,
+        },
+        $inc: { alertCount: 1 },
+      },
+      { returnDocument: "after" }
+    );
+
+    if (updated) {
+      dispatchedReminders.push(updated);
+
+      const foodNote = formatFoodTiming(updated.foodTiming);
+      const repeatMessage = `Pending dose: ${updated.dosage} ${updated.dosageUnit} of ${updated.medicationName} (${foodNote}). Please take your medication.`;
+
+      // 2a. Real-time Socket.IO alert to active clients
+      try {
+        const io = getIO();
+        if (io) {
+          io.to(`user:${updated.patientId}`).emit("medication:due_repeat", {
+            doseId: updated._id,
+            medicationName: updated.medicationName,
+            dosage: updated.dosage,
+            dosageUnit: updated.dosageUnit,
+            alertCount: updated.alertCount,
+            timestamp: nowDate.toISOString(),
+          });
+        }
+      } catch (socketErr) {
+        // Socket emission failure is non-blocking
+      }
+
+      // 2b. Background Web Push (system notification replaces previous with tag)
+      try {
+        await sendPushToUser(updated.patientId, {
+          title: `Medication Dose Due: ${updated.medicationName}`,
+          body: repeatMessage,
+          tag: "medication-due-reminder",
+          data: { url: "/medications", doseId: updated._id.toString() },
+        });
+      } catch (pushErr) {
+        console.warn("[MEDICATION_REMINDER] Repeating push dispatch warning:", pushErr.message);
+      }
     }
   }
 
@@ -301,7 +395,7 @@ const runMedicationReminderCycle = async () => {
 /**
  * Starts periodic background worker.
  */
-const startMedicationReminderWorker = (intervalMs = 60000) => {
+const startMedicationReminderWorker = (intervalMs = 30000) => {
   if (reminderWorkerTimer) {
     clearInterval(reminderWorkerTimer);
   }
@@ -332,6 +426,8 @@ const stopMedicationReminderWorker = () => {
 
 module.exports = {
   DEFAULT_GRACE_PERIOD_MS,
+  REPEAT_ALERT_INTERVAL_MS,
+  MAX_REPEAT_ALERTS,
   getTimezoneOffsetMs,
   parseScheduledTimeToUtc,
   formatDateInTimezone,

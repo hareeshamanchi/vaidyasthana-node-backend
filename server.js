@@ -25,7 +25,7 @@ initSocket(server);
 startAppointmentExpiryCron(60000);
 
 // Start automatic medication reminder and dose tracking worker
-startMedicationReminderWorker(60000);
+startMedicationReminderWorker(30000);
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT} (0.0.0.0)`);

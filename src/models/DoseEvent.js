@@ -92,6 +92,19 @@ const doseEventSchema = new mongoose.Schema(
       type: Date,
       default: null,
     },
+    lastAlertAt: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    alertCount: {
+      type: Number,
+      default: 0,
+    },
+    maxAlerts: {
+      type: Number,
+      default: 20,
+    },
     missedEvaluated: {
       type: Boolean,
       default: false,
@@ -113,6 +126,7 @@ doseEventSchema.index({ patientId: 1, scheduledDate: 1 });
 
 // High performance index for reminder worker & adherence statistics
 doseEventSchema.index({ status: 1, scheduledTime: 1 });
+doseEventSchema.index({ status: 1, lastAlertAt: 1 });
 doseEventSchema.index({ patientId: 1, scheduledTime: 1, status: 1 });
 
 module.exports = mongoose.model("DoseEvent", doseEventSchema);
