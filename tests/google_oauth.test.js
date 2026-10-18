@@ -630,7 +630,10 @@ const runTestSuite = async () => {
     console.log("Testing 18: Missing or unauthorized refresh token handling... ");
     _resetOAuthStates(); // Clears in-memory cache
     if (mongoose.connection.readyState === 1) {
-      await mongoose.model("EmailIntegration").deleteMany({ provider: "GMAIL_OAUTH2" });
+      await mongoose.model("EmailIntegration").deleteMany({
+        provider: "GMAIL_OAUTH2",
+        senderAddress: "vaidyasthana.clinical@gmail.com",
+      });
     }
 
     const unauthResult = await sendViaGmailOAuth({

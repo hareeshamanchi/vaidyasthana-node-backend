@@ -599,10 +599,11 @@ const revokeGmailAuthorization = async () => {
   inMemoryRefreshTokenCache = null;
 
   if (mongoose.connection.readyState === 1) {
-    await EmailIntegration.updateMany(
-      { provider: "GMAIL_OAUTH2" },
-      { status: "revoked", updatedAt: new Date() }
-    );
+    const filter = { provider: "GMAIL_OAUTH2" };
+    if (config.senderAddress) {
+      filter.senderAddress = config.senderAddress.toLowerCase().trim();
+    }
+    await EmailIntegration.updateMany(filter, { status: "revoked", updatedAt: new Date() });
   }
 
   return {
