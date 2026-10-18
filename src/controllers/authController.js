@@ -3,7 +3,11 @@ const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
-const { isEmailConfigured, sendPasswordResetEmail } = require("../services/emailService");
+const {
+  isEmailConfigured,
+  getEmailProvider,
+  sendPasswordResetEmail,
+} = require("../services/emailService");
 const { createNotification } = require("../services/notificationService");
 const { recordAuditEvent, extractIpAddress } = require("../services/auditService");
 
@@ -659,9 +663,15 @@ const getFrontendBaseUrl = (req) => {
     .replace(/^["']|["']$/g, "")
     .replace(/\/+$/, "");
 
+  const isProd =
+    process.env.NODE_ENV === "production" ||
+    process.env.RENDER === "true" ||
+    Boolean(process.env.RENDER_SERVICE_ID) ||
+    Boolean(process.env.RENDER_INSTANCE_ID);
+
   // If candidate is not explicitly set
   if (!candidate) {
-    if (process.env.NODE_ENV === "production") {
+    if (isProd) {
       return DEPLOYED_FRONTEND_URL;
     }
     const origin = req?.get ? req.get("origin") : req?.headers?.origin;
@@ -677,7 +687,7 @@ const getFrontendBaseUrl = (req) => {
       candidate
     );
 
-  if (process.env.NODE_ENV === "production") {
+  if (isProd) {
     if (isLocalOrPrivate) {
       console.warn(
         `[SAFE_DIAGNOSTIC] FRONTEND_URL (${candidate}) points to local/private network in production. Overriding with official deployed HTTPS URL (${DEPLOYED_FRONTEND_URL}).`
@@ -830,12 +840,12 @@ const forgotPassword = async (req, res) => {
 
     // Stage 5: URL Construction & Origin Verification
     const frontendBaseUrl = getFrontendBaseUrl(req);
-    const resetUrl = `${frontendBaseUrl}/reset-password/${rawToken}`;
+    const resetUrl = `${frontendBaseUrl}/reset-password/${encodeURIComponent(rawToken)}`;
     console.log(
       `[SAFE_DIAGNOSTIC] Stage 5: Reset URL generated using base origin: ${frontendBaseUrl}. Target route: /reset-password/<token_hash_redacted>. Verified HTTPS: ${resetUrl.startsWith("https://")}`
     );
 
-    // Stage 6 & 7: SMTP Dispatch
+    // Stage 6 & 7: Outbound Email Dispatch (Resend HTTPS / SMTP)
     console.log(
       `[SAFE_DIAGNOSTIC] Stage 6 & 7: Dispatching password reset email to masked recipient ${maskEmail(recipientEmail)}.`
     );
@@ -847,23 +857,33 @@ const forgotPassword = async (req, res) => {
     });
 
     const isConfigured = isEmailConfigured();
+    const activeProvider = getEmailProvider();
 
     // Stage 8: Delivery Confirmation & Distinction
     console.log(
-      `[SAFE_DIAGNOSTIC] Stage 8: Email dispatch result: delivered=${emailResult.delivered}, reason=${emailResult.reason}. (Note: SMTP acceptance confirms upstream relay handoff; inbox delivery depends on recipient spam filters/DNS).`
+      `[SAFE_DIAGNOSTIC] Stage 8: Email dispatch result: provider=${emailResult.provider || activeProvider}, accepted=${Boolean(emailResult.accepted || emailResult.providerAccepted || emailResult.smtpAccepted)}, delivered=${Boolean(emailResult.delivered)}, reason=${emailResult.reason}. (Note: Provider acceptance confirms upstream dispatch; inbox delivery depends on recipient spam filters/DNS).`
     );
+
+    const isProdEnv =
+      process.env.NODE_ENV === "production" ||
+      process.env.RENDER === "true" ||
+      Boolean(process.env.RENDER_SERVICE_ID) ||
+      Boolean(process.env.RENDER_INSTANCE_ID);
 
     return res.status(200).json({
       ...genericResponse,
       emailDelivery: {
         configured: isConfigured,
+        accepted: Boolean(emailResult.accepted || emailResult.providerAccepted || emailResult.smtpAccepted),
         delivered: Boolean(emailResult.delivered),
-        reason: emailResult.reason || (emailResult.delivered ? "DELIVERED" : "FAILED"),
+        provider: emailResult.provider || activeProvider,
+        reason: emailResult.reason || (emailResult.accepted ? "ACCEPTED" : "FAILED"),
+        messageId: emailResult.messageId || undefined,
         smtpAccepted: Boolean(emailResult.smtpAccepted),
         inboxDeliveryGuaranteed: Boolean(emailResult.inboxDeliveryGuaranteed),
       },
-      // In local development only (when NODE_ENV is development and email unconfigured), supply devResetUrl
-      ...(process.env.NODE_ENV === "development" && !emailResult.delivered
+      // In local development only (when not in production and email unconfigured or not accepted), supply devResetUrl
+      ...(!isProdEnv && !emailResult.delivered && !emailResult.accepted
         ? { devResetUrl: resetUrl }
         : {}),
     });

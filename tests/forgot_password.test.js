@@ -277,7 +277,9 @@ const runSuite = async () => {
     // Test 10: Email service configuration verification
     console.log("Testing 10: Email service safe unconfigured report... ");
     const originalHost = process.env.SMTP_HOST;
+    const originalResendKey = process.env.RESEND_API_KEY;
     delete process.env.SMTP_HOST;
+    delete process.env.RESEND_API_KEY;
     assert.strictEqual(isEmailConfigured(), false);
     const emailRes = await sendPasswordResetEmail({
       to: "test@example.com",
@@ -285,8 +287,22 @@ const runSuite = async () => {
       resetUrl: "http://localhost:3000/reset-password/sampletoken",
     });
     assert.strictEqual(emailRes.delivered, false);
-    assert.strictEqual(emailRes.reason, "SMTP_NOT_CONFIGURED");
+    assert.strictEqual(emailRes.reason, "EMAIL_NOT_CONFIGURED");
+
+    // In production environment without RESEND_API_KEY, safely returns RESEND_NOT_CONFIGURED
+    const origEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = "production";
+    const prodEmailRes = await sendPasswordResetEmail({
+      to: "test@example.com",
+      name: "Test User",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/sampletoken",
+    });
+    assert.strictEqual(prodEmailRes.delivered, false);
+    assert.strictEqual(prodEmailRes.reason, "RESEND_NOT_CONFIGURED");
+    if (origEnv !== undefined) process.env.NODE_ENV = origEnv; else delete process.env.NODE_ENV;
+
     if (originalHost) process.env.SMTP_HOST = originalHost;
+    if (originalResendKey) process.env.RESEND_API_KEY = originalResendKey;
     console.log("✔ PASSED");
 
     // Test 11: Production reset URL enforcement & localhost/LAN IP protection
@@ -325,14 +341,16 @@ const runSuite = async () => {
     assert.strictEqual(isTestPlaceholderEmail("user@example.com"), true);
     assert.strictEqual(isTestPlaceholderEmail("realuser@gmail.com"), false);
 
-    // Verify placeholder emails safely bypass live SMTP dispatch
+    // Verify placeholder emails safely bypass live dispatch
     const placeholderEmailRes = await sendPasswordResetEmail({
       to: "reset_patient_123456@vaidyasthana.com",
       name: "Placeholder Patient",
       resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/sampletoken",
     });
-    assert.strictEqual(placeholderEmailRes.delivered, true);
+    assert.strictEqual(placeholderEmailRes.accepted, true);
     assert.strictEqual(placeholderEmailRes.reason, "TEST_FIXTURE_BYPASS");
+    console.log("✔ PASSED");
+
     // Test 13: Privacy & PII Protection via maskEmail
     console.log("Testing 13: Safe email masking and PII redaction... ");
     assert.strictEqual(maskEmail("patient@vaidyasthana.com"), "p***t@vaidyasthana.com");
@@ -381,16 +399,15 @@ const runSuite = async () => {
     if (prevPass) process.env.SMTP_PASS = prevPass; else delete process.env.SMTP_PASS;
     console.log("✔ PASSED");
 
-    // Test 15: SMTP acceptance vs inbox delivery distinction
-    console.log("Testing 15: SMTP relay acceptance vs final inbox delivery distinction... ");
+    // Test 15: Upstream relay acceptance vs final inbox delivery distinction
+    console.log("Testing 15: Upstream relay acceptance vs final inbox delivery distinction... ");
     const mockEmailResult = await sendPasswordResetEmail({
       to: "reset_doctor_test@vaidyasthana.com",
       name: "Dr. Test",
       resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/tok123",
     });
-    assert.strictEqual(mockEmailResult.delivered, true);
-    assert.strictEqual(mockEmailResult.smtpAccepted, true);
-    assert.strictEqual(mockEmailResult.inboxDeliveryGuaranteed, true); // True for test fixtures
+    assert.strictEqual(mockEmailResult.accepted, true);
+    assert.strictEqual(mockEmailResult.providerAccepted, true);
     console.log("✔ PASSED");
 
     // Test 16: Database readiness guard (503 Service Unavailable when DB is disconnected)
