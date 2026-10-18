@@ -50,10 +50,42 @@ const userSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ["patient", "doctor", "admin"],
+      enum: ["patient", "doctor", "admin", "superadmin"],
       default: "patient",
       index: true,
     },
+    status: {
+      type: String,
+      enum: ["active", "suspended"],
+      default: "active",
+      index: true,
+    },
+    suspensionHistory: [
+      {
+        action: {
+          type: String,
+          enum: ["suspended", "reactivated"],
+          required: true,
+        },
+        reason: {
+          type: String,
+          required: true,
+          trim: true,
+        },
+        performedBy: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "User",
+        },
+        performedByEmail: {
+          type: String,
+          default: "",
+        },
+        timestamp: {
+          type: Date,
+          default: Date.now,
+        },
+      },
+    ],
     gender: {
       type: String,
       enum: ["Male", "Female", "Other", ""],
@@ -144,5 +176,7 @@ const userSchema = new mongoose.Schema(
 );
 
 userSchema.index({ role: 1, verificationStatus: 1 });
+userSchema.index({ role: 1, status: 1 });
+userSchema.index({ status: 1, createdAt: -1 });
 
 module.exports = mongoose.model("User", userSchema);

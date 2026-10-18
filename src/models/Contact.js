@@ -27,6 +27,21 @@ const contactSchema = new mongoose.Schema(
       type: String,
       enum: ["New", "In Review", "Resolved"],
       default: "New",
+      index: true,
+    },
+    resolutionNotes: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    resolvedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      default: null,
+    },
+    resolvedAt: {
+      type: Date,
+      default: null,
     },
     ipAddress: {
       type: String,
@@ -37,5 +52,7 @@ const contactSchema = new mongoose.Schema(
     timestamps: true,
   }
 );
+
+contactSchema.index({ status: 1, createdAt: -1 });
 
 module.exports = mongoose.model("Contact", contactSchema);

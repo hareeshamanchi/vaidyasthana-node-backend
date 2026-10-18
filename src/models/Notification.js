@@ -29,6 +29,9 @@ const notificationSchema = new mongoose.Schema(
         "report_uploaded",
         "report_analyzed",
         "security_event",
+        "doctor_verification_pending",
+        "support_request",
+        "system_alert",
         "general",
       ],
       default: "general",
@@ -41,7 +44,7 @@ const notificationSchema = new mongoose.Schema(
     },
     relatedModel: {
       type: String,
-      enum: ["Appointment", "Report", "User", null],
+      enum: ["Appointment", "Report", "User", "Contact", null],
       default: null,
     },
     link: {

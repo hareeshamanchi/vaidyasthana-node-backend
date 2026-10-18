@@ -5,9 +5,12 @@ const mongoose = require("mongoose");
 const crypto = require("crypto");
 const { isEmailConfigured, sendPasswordResetEmail } = require("../services/emailService");
 const { createNotification } = require("../services/notificationService");
+const { recordAuditEvent, extractIpAddress } = require("../services/auditService");
 
 // Rate limiting map for password reset requests: key -> array of timestamps
 const passwordResetAttempts = new Map();
+// Rate limiting map for login requests: key -> array of timestamps
+const loginAttempts = new Map();
 
 const isRateLimited = (identifier, maxAttempts = 5, windowMs = 15 * 60 * 1000) => {
   const now = Date.now();
@@ -23,8 +26,32 @@ const isRateLimited = (identifier, maxAttempts = 5, windowMs = 15 * 60 * 1000) =
   return false;
 };
 
+const isLoginRateLimited = (identifier, maxAttempts = 10, windowMs = 15 * 60 * 1000) => {
+  const now = Date.now();
+  const timestamps = loginAttempts.get(identifier) || [];
+  const validTimestamps = timestamps.filter((t) => now - t < windowMs);
+
+  if (validTimestamps.length >= maxAttempts) {
+    return true;
+  }
+
+  return false;
+};
+
+const recordFailedLogin = (identifier) => {
+  const now = Date.now();
+  const timestamps = loginAttempts.get(identifier) || [];
+  timestamps.push(now);
+  loginAttempts.set(identifier, timestamps);
+};
+
+const clearLoginAttempts = (identifier) => {
+  loginAttempts.delete(identifier);
+};
+
 const _resetRateLimits = () => {
   passwordResetAttempts.clear();
+  loginAttempts.clear();
 };
 
 const isDbConnected = () => mongoose.connection.readyState === 1;
@@ -168,7 +195,9 @@ const registerUser = async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 
-    const assignedRole = role === "doctor" ? "doctor" : role === "admin" ? "admin" : "patient";
+    // Security Rule: Public registration can ONLY create "patient" or "doctor" accounts.
+    // Privileged roles ("admin", "superadmin") can NEVER be registered publicly.
+    const assignedRole = role === "doctor" ? "doctor" : "patient";
 
     // Clinician verification: doctors registering with credentials are verified and eligible to accept appointments
     const verificationStatus =
@@ -187,6 +216,7 @@ const registerUser = async (req, res) => {
       state: state ? state.trim() : "",
       postalCode: postalCode ? postalCode.trim() : "",
       role: assignedRole,
+      status: "active",
       specialization: assignedRole === "doctor" ? (specialization ? specialization.trim() : "General Medicine") : "General Medicine",
       qualifications: assignedRole === "doctor" ? (qualifications ? qualifications.trim() : "MBBS") : "MBBS",
       medicalRegistrationNumber: medicalRegistrationNumber ? medicalRegistrationNumber.trim() : "",
@@ -204,6 +234,14 @@ const registerUser = async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
+    recordAuditEvent({
+      eventType: "AUTH_REGISTER_SUCCESS",
+      actor: user,
+      action: `New ${user.role} account registered`,
+      outcome: "success",
+      req,
+    });
+
     return res.status(201).json({
       success: true,
       message: "Account registered successfully",
@@ -219,6 +257,7 @@ const registerUser = async (req, res) => {
         state: user.state,
         postalCode: user.postalCode,
         role: user.role,
+        status: user.status,
         specialization: user.specialization,
         verificationStatus: user.verificationStatus,
         profileComplete: Boolean(user.phoneNumber && user.address),
@@ -256,22 +295,92 @@ const loginUser = async (req, res) => {
     }
 
     const normalizedEmail = email.toLowerCase().trim();
+    const clientIp = extractIpAddress(req);
+    const rateLimitKey = `${clientIp}_${normalizedEmail}`;
+
+    // Rate Limiting on repeated failed logins
+    if (isLoginRateLimited(rateLimitKey, 10, 15 * 60 * 1000)) {
+      recordAuditEvent({
+        eventType: "RATE_LIMIT_TRIGGERED",
+        actorEmail: normalizedEmail,
+        action: "Login attempt throttled due to excessive failures",
+        outcome: "warning",
+        reason: "Too many consecutive failed login attempts",
+        req,
+      });
+
+      return res.status(429).json({
+        success: false,
+        message: "Too many failed login attempts. Please wait 15 minutes before trying again.",
+      });
+    }
+
     const user = await User.findOne({ email: normalizedEmail });
 
     if (!user) {
+      recordFailedLogin(rateLimitKey);
+      recordAuditEvent({
+        eventType: "AUTH_LOGIN_FAILURE",
+        actorEmail: normalizedEmail,
+        action: "Login failed - account does not exist",
+        outcome: "failure",
+        reason: "Invalid credentials",
+        req,
+      });
+
       return res.status(401).json({
         success: false,
         message: "Invalid email or password.",
+      });
+    }
+
+    // Check account status: prevent suspended accounts from logging in
+    if (user.status === "suspended") {
+      recordAuditEvent({
+        eventType: "AUTH_SUSPENDED_LOGIN_ATTEMPT",
+        actor: user,
+        action: "Suspended user attempted login",
+        outcome: "failure",
+        reason: "Account is suspended",
+        req,
+      });
+
+      return res.status(403).json({
+        success: false,
+        code: "ACCOUNT_SUSPENDED",
+        message: "Your account has been suspended. Please contact platform administration.",
       });
     }
 
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
+      recordFailedLogin(rateLimitKey);
+      recordAuditEvent({
+        eventType: "AUTH_LOGIN_FAILURE",
+        actor: user,
+        action: "Login failed - incorrect password",
+        outcome: "failure",
+        reason: "Invalid credentials",
+        req,
+      });
+
       return res.status(401).json({
         success: false,
         message: "Invalid email or password.",
       });
     }
+
+    // Successful login: reset failed login counter
+    clearLoginAttempts(rateLimitKey);
+
+    const isSuperOrAdmin = user.role === "superadmin" || user.role === "admin";
+    recordAuditEvent({
+      eventType: isSuperOrAdmin ? "AUTH_ADMIN_LOGIN_SUCCESS" : "AUTH_LOGIN_SUCCESS",
+      actor: user,
+      action: `${user.role} logged in successfully`,
+      outcome: "success",
+      req,
+    });
 
     const token = generateToken(user);
 
@@ -300,6 +409,7 @@ const loginUser = async (req, res) => {
         state: user.state,
         postalCode: user.postalCode,
         role: user.role,
+        status: user.status || "active",
         specialization: user.specialization,
         qualifications: user.qualifications,
         verificationStatus: user.verificationStatus,
@@ -364,6 +474,7 @@ const getProfile = async (req, res) => {
       state: user.state || "",
       postalCode: user.postalCode || "",
       role: user.role,
+      status: user.status || "active",
       gender: user.gender,
       bloodGroup: user.bloodGroup,
       dateOfBirth: user.dateOfBirth,
@@ -698,6 +809,15 @@ const forgotPassword = async (req, res) => {
       `[SAFE_DIAGNOSTIC] Stage 4: Cryptographic token generated (256-bit entropy). SHA-256 digest committed to MongoDB Atlas. Expiry: ${expiresInMinutes} minutes.`
     );
 
+    recordAuditEvent({
+      eventType: "AUTH_PASSWORD_RESET_REQUEST",
+      actor: user,
+      action: "Password reset requested",
+      outcome: "success",
+      details: { maskedEmail: maskEmail(recipientEmail) },
+      req,
+    });
+
     // Notify user of security event
     createNotification({
       userId: user._id,
@@ -859,6 +979,14 @@ const resetPassword = async (req, res) => {
     user.resetPasswordExpires = undefined;
 
     await user.save();
+
+    recordAuditEvent({
+      eventType: "AUTH_PASSWORD_RESET_SUCCESS",
+      actor: user,
+      action: "Password reset completed successfully",
+      outcome: "success",
+      req,
+    });
 
     createNotification({
       userId: user._id,
