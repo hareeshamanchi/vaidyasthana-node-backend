@@ -21,7 +21,7 @@ const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const User = require("../src/models/User");
-const { recordAuditEvent } = require("../services/auditService");
+const { recordAuditEvent } = require("../src/services/auditService");
 
 const runBootstrap = async () => {
   try {
