@@ -8,6 +8,10 @@ const {
   startAppointmentExpiryCron,
   stopAppointmentExpiryCron,
 } = require("./src/services/appointmentExpiryService");
+const {
+  startMedicationReminderWorker,
+  stopMedicationReminderWorker,
+} = require("./src/services/medicationReminderService");
 
 connectDB();
 
@@ -20,6 +24,9 @@ initSocket(server);
 // Start automatic appointment status & consultation expiry worker
 startAppointmentExpiryCron(60000);
 
+// Start automatic medication reminder and dose tracking worker
+startMedicationReminderWorker(60000);
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT} (0.0.0.0)`);
 });
@@ -31,6 +38,7 @@ const handleShutdown = async (signal) => {
     console.log("✅ HTTP server closed.");
     try {
       stopAppointmentExpiryCron();
+      stopMedicationReminderWorker();
       const { disconnectDB } = require("./src/config/db");
       await disconnectDB();
     } catch (e) {

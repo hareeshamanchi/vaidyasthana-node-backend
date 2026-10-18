@@ -32,6 +32,8 @@ const notificationSchema = new mongoose.Schema(
         "doctor_verification_pending",
         "support_request",
         "system_alert",
+        "medication_reminder",
+        "medication_missed",
         "general",
       ],
       default: "general",
@@ -44,7 +46,7 @@ const notificationSchema = new mongoose.Schema(
     },
     relatedModel: {
       type: String,
-      enum: ["Appointment", "Report", "User", "Contact", null],
+      enum: ["Appointment", "Report", "User", "Contact", "Medication", "DoseEvent", null],
       default: null,
     },
     link: {

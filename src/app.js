@@ -13,6 +13,7 @@ const adminRoutes = require("./routes/adminRoutes");
 const nutritionRoutes = require("./routes/nutritionRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
 const timelineRoutes = require("./routes/timelineRoutes");
+const medicationRoutes = require("./routes/medicationRoutes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -79,6 +80,7 @@ app.use("/api/health", healthRoutes);
 app.use("/api/nutrition", nutritionRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/timeline", timelineRoutes);
+app.use("/api/medications", medicationRoutes);
 
 /*
 |--------------------------------------------------------------------------
@@ -103,6 +105,7 @@ app.get("/", (req, res) => {
       nutrition: "/api/nutrition",
       notifications: "/api/notifications",
       timeline: "/api/timeline",
+      medications: "/api/medications",
     },
   });
 });
