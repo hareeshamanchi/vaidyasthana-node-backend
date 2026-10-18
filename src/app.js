@@ -14,6 +14,7 @@ const nutritionRoutes = require("./routes/nutritionRoutes");
 const notificationRoutes = require("./routes/notificationRoutes");
 const timelineRoutes = require("./routes/timelineRoutes");
 const medicationRoutes = require("./routes/medicationRoutes");
+const googleOAuthRoutes = require("./routes/googleOAuthRoutes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -81,6 +82,7 @@ app.use("/api/nutrition", nutritionRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/timeline", timelineRoutes);
 app.use("/api/medications", medicationRoutes);
+app.use("/api/auth/google", googleOAuthRoutes);
 
 /*
 |--------------------------------------------------------------------------
