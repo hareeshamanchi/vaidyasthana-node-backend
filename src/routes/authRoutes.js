@@ -23,4 +23,8 @@ router.post("/forgot-password", forgotPassword);
 router.get("/reset-password/:token", validateResetToken);
 router.post("/reset-password/:token", resetPassword);
 
+// Google OAuth 2.0 Gmail Sender Integration
+const googleOAuthRoutes = require("./googleOAuthRoutes");
+router.use("/google", googleOAuthRoutes);
+
 module.exports = router;

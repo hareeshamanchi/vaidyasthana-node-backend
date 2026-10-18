@@ -376,8 +376,86 @@ const runTestSuite = async () => {
     assert.strictEqual(postRevokeStatus.authorized, false);
     console.log("✔ PASSED");
 
+    // -------------------------------------------------------------------
+    // Test 13: Registered Route Paths & 404 Bypass Verification
+    // -------------------------------------------------------------------
+    console.log("Testing 13: Verifying all registered route paths and 404 bypass... ");
+    process.env.GMAIL_SETUP_SECRET = "super_secure_setup_secret_passphrase_2026";
+
+    // 13a: Direct GET /api/auth/google/authorize with query params (e.g. from chatgpt link)
+    const resAuthWithUtm = await fetch(
+      `${baseUrl}/api/auth/google/authorize?utm_source=chatgpt.com&setupSecret=super_secure_setup_secret_passphrase_2026`,
+      { headers: { Accept: "application/json" } }
+    );
+    assert.strictEqual(resAuthWithUtm.status, 200);
+    const dataAuthWithUtm = await resAuthWithUtm.json();
+    assert.strictEqual(dataAuthWithUtm.success, true);
+    assert.ok(dataAuthWithUtm.authUrl);
+
+    // 13b: GET /api/auth/google root
+    const resGoogleRoot = await fetch(
+      `${baseUrl}/api/auth/google?setupSecret=super_secure_setup_secret_passphrase_2026`,
+      { headers: { Accept: "application/json" } }
+    );
+    assert.strictEqual(resGoogleRoot.status, 200);
+    const dataGoogleRoot = await resGoogleRoot.json();
+    assert.strictEqual(dataGoogleRoot.success, true);
+
+    // 13c: GET /api/auth/google/url
+    const resGoogleUrl = await fetch(
+      `${baseUrl}/api/auth/google/url?setupSecret=super_secure_setup_secret_passphrase_2026`,
+      { headers: { Accept: "application/json" } }
+    );
+    assert.strictEqual(resGoogleUrl.status, 200);
+
+    // 13d: GET /api/auth/google/status
+    const resGoogleStatus = await fetch(
+      `${baseUrl}/api/auth/google/status?setupSecret=super_secure_setup_secret_passphrase_2026`,
+      { headers: { Accept: "application/json" } }
+    );
+    assert.strictEqual(resGoogleStatus.status, 200);
+
+    // 13e: POST /api/auth/google/revoke
+    const resGoogleRevoke = await fetch(
+      `${baseUrl}/api/auth/google/revoke?setupSecret=super_secure_setup_secret_passphrase_2026`,
+      {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+      }
+    );
+    assert.strictEqual(resGoogleRevoke.status, 200);
+
+    // 13f: Browser redirect mode (?redirect=true) returns HTTP 302 to accounts.google.com
+    const resRedirect = await fetch(
+      `${baseUrl}/api/auth/google/authorize?setupSecret=super_secure_setup_secret_passphrase_2026&redirect=true`,
+      { redirect: "manual" }
+    );
+    assert.strictEqual(resRedirect.status, 302);
+    const redirectLocation = resRedirect.headers.get("location");
+    assert.ok(redirectLocation && redirectLocation.includes("accounts.google.com"));
+
+    // 13g: Browser HTML card mode when no redirect=true
+    const resBrowserHtml = await fetch(
+      `${baseUrl}/api/auth/google/authorize?setupSecret=super_secure_setup_secret_passphrase_2026`,
+      { headers: { Accept: "text/html" } }
+    );
+    assert.strictEqual(resBrowserHtml.status, 200);
+    const htmlText = await resBrowserHtml.text();
+    assert.ok(htmlText.includes("Google OAuth Authorization Ready"));
+    assert.ok(htmlText.includes("Proceed to Google Account Authorization"));
+
+    // 13h: Browser HTML card mode when unauthorized (403 HTML card)
+    const resBrowserForbidden = await fetch(`${baseUrl}/api/auth/google/authorize`, {
+      headers: { Accept: "text/html" },
+    });
+    assert.strictEqual(resBrowserForbidden.status, 403);
+    const forbiddenHtml = await resBrowserForbidden.text();
+    assert.ok(forbiddenHtml.includes("Administrative Setup Access Required"));
+
+    console.log("✔ PASSED");
+
     console.log("\n=================================================");
-    console.log("  ALL 12 GOOGLE OAUTH 2.0 GMAIL TESTS PASSED!    ");
+    console.log("  ALL 13 GOOGLE OAUTH 2.0 GMAIL TESTS PASSED!    ");
     console.log("=================================================\n");
   } catch (err) {
     console.error("\n❌ GOOGLE OAUTH TEST SUITE FAILED:", err);

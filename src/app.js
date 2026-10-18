@@ -68,6 +68,7 @@ app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 | API Routes
 |--------------------------------------------------------------------------
 */
+app.use("/api/auth/google", googleOAuthRoutes);
 app.use("/api/auth", authRoutes);
 app.use("/upload", uploadRoutes);
 app.use("/api/reports", uploadRoutes);
@@ -82,7 +83,6 @@ app.use("/api/nutrition", nutritionRoutes);
 app.use("/api/notifications", notificationRoutes);
 app.use("/api/timeline", timelineRoutes);
 app.use("/api/medications", medicationRoutes);
-app.use("/api/auth/google", googleOAuthRoutes);
 
 /*
 |--------------------------------------------------------------------------

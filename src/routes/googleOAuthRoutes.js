@@ -46,11 +46,13 @@ const populateUserIfPresent = (req, res, next) => {
 router.use(populateUserIfPresent);
 
 // 1. Authorization Initiation (Restricted to Admin or setup secret)
+router.get("/", initiateOAuthSetup);
 router.get("/authorize", initiateOAuthSetup);
 router.get("/url", initiateOAuthSetup);
 
 // 2. OAuth 2.0 Redirect Callback (Invoked by Google)
 router.get("/callback", handleOAuthCallback);
+router.post("/callback", handleOAuthCallback);
 
 // 3. Integration Status (Restricted to Admin or setup secret)
 router.get("/status", getOAuthStatus);

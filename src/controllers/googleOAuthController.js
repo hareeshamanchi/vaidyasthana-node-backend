@@ -29,7 +29,9 @@ const isSetupAuthorized = (req) => {
     req.headers["x-setup-secret"] ||
     req.headers["x-gmail-setup-key"] ||
     req.query.setupSecret ||
-    req.query.setup_secret;
+    req.query.setup_secret ||
+    req.query.secret ||
+    req.query.key;
 
   if (configuredSecret && suppliedSecret && cleanEnv(suppliedSecret) === configuredSecret) {
     return {
@@ -192,8 +194,29 @@ const renderHtmlResponse = ({ success, title, message, details, recovery, meta }
  */
 const initiateOAuthSetup = async (req, res) => {
   try {
+    const acceptsHtml =
+      req.headers.accept &&
+      req.headers.accept.includes("text/html") &&
+      !req.headers.accept.includes("application/json");
+
     const authCheck = isSetupAuthorized(req);
     if (!authCheck.authorized) {
+      if (acceptsHtml) {
+        return res.status(403).send(
+          renderHtmlResponse({
+            success: false,
+            title: "Administrative Setup Access Required",
+            message:
+              "This endpoint initiates a one-time Google OAuth authorization for the Gmail sender account.",
+            details:
+              "To access this endpoint, provide either a valid <code>setupSecret</code> query parameter matching your <code>GMAIL_SETUP_SECRET</code> environment variable, or sign in as an Administrator.",
+            recovery:
+              "Append <code>?setupSecret=&lt;YOUR_GMAIL_SETUP_SECRET&gt;&amp;redirect=true</code> to your browser URL, or include header <code>x-setup-secret</code>.",
+            meta: { frontendUrl: process.env.FRONTEND_URL },
+          })
+        );
+      }
+
       return res.status(403).json({
         success: false,
         code: "SETUP_UNAUTHORIZED",
@@ -222,6 +245,21 @@ const initiateOAuthSetup = async (req, res) => {
     // If caller explicitly requested browser redirect via redirect=true
     if (req.query.redirect === "true") {
       return res.redirect(authUrl);
+    }
+
+    // In a browser without redirect=true, render an informative page with a one-click button
+    if (acceptsHtml) {
+      return res.status(200).send(
+        renderHtmlResponse({
+          success: true,
+          title: "Google OAuth Authorization Ready",
+          message:
+            "Click the button below to sign in with your designated Gmail sender account and grant sending permissions.",
+          details: `Redirect URI: <code>${redirectUri}</code><br>Target Scope: <code>https://www.googleapis.com/auth/gmail.send</code>`,
+          recovery: `<a href="${authUrl}" class="btn" style="display:inline-block; margin-top:8px;">Proceed to Google Account Authorization &rarr;</a>`,
+          meta: { frontendUrl: process.env.FRONTEND_URL },
+        })
+      );
     }
 
     return res.status(200).json({
