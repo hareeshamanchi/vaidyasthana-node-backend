@@ -36,15 +36,59 @@ const sanitizeAuditDetails = (details) => {
 };
 
 /**
- * Safely extracts client IP address from request headers or socket.
+ * Safely extracts client IP address from reverse proxy headers, req.ip, or socket.
+ * Handles Cloudflare, standard X-Forwarded-For, X-Real-IP, and strips IPv6-mapped IPv4 prefixes.
  */
 const extractIpAddress = (req) => {
   if (!req) return "";
-  const forwarded = req.headers?.["x-forwarded-for"];
-  if (forwarded && typeof forwarded === "string") {
-    return forwarded.split(",")[0].trim();
+  
+  // 1. Cloudflare connecting IP
+  const cfConnecting = req.headers?.["cf-connecting-ip"];
+  if (cfConnecting && typeof cfConnecting === "string" && cfConnecting.trim()) {
+    return cfConnecting.trim().replace(/^::ffff:/, "");
   }
-  return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || "";
+
+  // 2. Nginx / reverse proxy X-Real-IP
+  const realIp = req.headers?.["x-real-ip"];
+  if (realIp && typeof realIp === "string" && realIp.trim()) {
+    return realIp.trim().replace(/^::ffff:/, "");
+  }
+
+  // 3. Standard X-Forwarded-For (client is the leftmost IP in the chain)
+  const forwarded = req.headers?.["x-forwarded-for"];
+  if (forwarded && typeof forwarded === "string" && forwarded.trim()) {
+    const firstIp = forwarded.split(",")[0].trim();
+    if (firstIp) {
+      return firstIp.replace(/^::ffff:/, "");
+    }
+  }
+
+  // 4. Express req.ip (populated when trust proxy is enabled) or raw socket remote address
+  const rawIp = req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || "";
+  return typeof rawIp === "string" ? rawIp.replace(/^::ffff:/, "").trim() : "";
+};
+
+/**
+ * Masks an IP address for safe diagnostics without leaking PII.
+ * IPv4: '198.51.100.42' -> '198.51.***.***'
+ * IPv6: '2001:db8:85a3::8a2e:370:7334' -> '2001:db8:****'
+ */
+const maskIp = (ip) => {
+  if (!ip || typeof ip !== "string") return "[UNKNOWN_IP]";
+  const cleanIp = ip.replace(/^::ffff:/, "").trim();
+  if (cleanIp === "127.0.0.1" || cleanIp === "::1" || cleanIp === "localhost") {
+    return "127.0.0.***";
+  }
+  if (cleanIp.includes(".")) {
+    const parts = cleanIp.split(".");
+    if (parts.length === 4) {
+      return `${parts[0]}.${parts[1]}.***.***`;
+    }
+  } else if (cleanIp.includes(":")) {
+    const parts = cleanIp.split(":");
+    return `${parts.slice(0, 2).join(":")}:****`;
+  }
+  return cleanIp.length > 4 ? `${cleanIp.slice(0, 3)}***` : "***";
 };
 
 /**
@@ -104,4 +148,5 @@ module.exports = {
   recordAuditEvent,
   sanitizeAuditDetails,
   extractIpAddress,
+  maskIp,
 };

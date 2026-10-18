@@ -9,19 +9,145 @@ const {
   sendPasswordResetEmail,
 } = require("../services/emailService");
 const { createNotification } = require("../services/notificationService");
-const { recordAuditEvent, extractIpAddress } = require("../services/auditService");
+const { recordAuditEvent, extractIpAddress, maskIp } = require("../services/auditService");
 
-// Rate limiting map for password reset requests: key -> array of timestamps
+// Rate limiting configuration
+const RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+const DEFAULT_EMAIL_LIMIT = 5; // 5 attempts per 15 min per email (protects inbox from spam)
+const DEFAULT_IP_LIMIT = 30; // 30 attempts per 15 min per IP (accommodates shared hospital/clinic networks & prevents bot enumeration)
+
+// Rate limiting storage: key -> array of timestamps
 const passwordResetAttempts = new Map();
+// In-flight request tracker to prevent duplicate concurrent submissions from burning tokens
+const inFlightPasswordResets = new Set();
 // Rate limiting map for login requests: key -> array of timestamps
 const loginAttempts = new Map();
 
-const isRateLimited = (identifier, maxAttempts = 5, windowMs = 15 * 60 * 1000) => {
+/**
+ * Prunes expired timestamps older than windowMs.
+ *
+ * @param {number[]} timestamps
+ * @param {number} now
+ * @param {number} windowMs
+ * @returns {number[]}
+ */
+const pruneTimestamps = (timestamps, now, windowMs) => {
+  if (!Array.isArray(timestamps)) return [];
+  return timestamps.filter((t) => now - t < windowMs);
+};
+
+/**
+ * Periodically sweeps and purges expired entries from memory to prevent map leaks.
+ */
+const sweepStaleRateLimits = (now = Date.now(), windowMs = RATE_LIMIT_WINDOW_MS) => {
+  for (const [key, timestamps] of passwordResetAttempts.entries()) {
+    const valid = pruneTimestamps(timestamps, now, windowMs);
+    if (valid.length === 0) {
+      passwordResetAttempts.delete(key);
+    } else {
+      passwordResetAttempts.set(key, valid);
+    }
+  }
+  for (const [key, timestamps] of loginAttempts.entries()) {
+    const valid = pruneTimestamps(timestamps, now, windowMs);
+    if (valid.length === 0) {
+      loginAttempts.delete(key);
+    } else {
+      loginAttempts.set(key, valid);
+    }
+  }
+};
+
+// Automatic sweep every 5 minutes (unref so process can exit cleanly during tests)
+const sweepTimer = setInterval(sweepStaleRateLimits, 5 * 60 * 1000);
+if (sweepTimer.unref) sweepTimer.unref();
+
+/**
+ * Differentiated rate limiter for Forgot Password requests.
+ * - Enforces per-email quota (default: 5 / 15m) to protect individual email accounts.
+ * - Enforces per-IP quota (default: 30 / 15m) to accommodate shared hospital/clinic networks
+ *   while mitigating automated bot enumeration attacks.
+ * - Prunes stale timestamps on access.
+ * - Returns detailed diagnostic metrics and Retry-After duration.
+ *
+ * @param {{ email: string, clientIp: string, now?: number }} params
+ * @returns {{
+ *   limited: boolean,
+ *   triggerType?: 'email' | 'ip',
+ *   count?: number,
+ *   max?: number,
+ *   retryAfterSeconds?: number,
+ *   maskedKey?: string
+ * }}
+ */
+const checkForgotPasswordRateLimit = ({ email, clientIp, now = Date.now() }) => {
+  const windowMs = RATE_LIMIT_WINDOW_MS;
+  const maxEmailAttempts =
+    parseInt(process.env.FORGOT_PASSWORD_EMAIL_LIMIT, 10) || DEFAULT_EMAIL_LIMIT;
+  const maxIpAttempts =
+    parseInt(process.env.FORGOT_PASSWORD_IP_LIMIT, 10) || DEFAULT_IP_LIMIT;
+
+  const emailKey = `email:${(email || "").toLowerCase().trim()}`;
+  const ipKey = `ip:${(clientIp || "unknown").trim()}`;
+
+  // 1. Check per-email bucket
+  const emailTimestamps = pruneTimestamps(
+    passwordResetAttempts.get(emailKey) || [],
+    now,
+    windowMs
+  );
+  if (emailTimestamps.length >= maxEmailAttempts) {
+    passwordResetAttempts.set(emailKey, emailTimestamps);
+    const oldest = emailTimestamps[0];
+    const retryAfterSeconds = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
+    return {
+      limited: true,
+      triggerType: "email",
+      count: emailTimestamps.length,
+      max: maxEmailAttempts,
+      retryAfterSeconds,
+      maskedKey: maskEmail(email),
+    };
+  }
+
+  // 2. Check per-IP bucket
+  const ipTimestamps = pruneTimestamps(
+    passwordResetAttempts.get(ipKey) || [],
+    now,
+    windowMs
+  );
+  if (ipTimestamps.length >= maxIpAttempts) {
+    passwordResetAttempts.set(ipKey, ipTimestamps);
+    const oldest = ipTimestamps[0];
+    const retryAfterSeconds = Math.max(1, Math.ceil((oldest + windowMs - now) / 1000));
+    return {
+      limited: true,
+      triggerType: "ip",
+      count: ipTimestamps.length,
+      max: maxIpAttempts,
+      retryAfterSeconds,
+      maskedKey: maskIp(clientIp),
+    };
+  }
+
+  // 3. Record attempt in both buckets
+  emailTimestamps.push(now);
+  passwordResetAttempts.set(emailKey, emailTimestamps);
+
+  ipTimestamps.push(now);
+  passwordResetAttempts.set(ipKey, ipTimestamps);
+
+  return { limited: false };
+};
+
+// Legacy helper preserved for backward compatibility and direct helper tests
+const isRateLimited = (identifier, maxAttempts = 5, windowMs = RATE_LIMIT_WINDOW_MS) => {
   const now = Date.now();
   const timestamps = passwordResetAttempts.get(identifier) || [];
-  const validTimestamps = timestamps.filter((t) => now - t < windowMs);
+  const validTimestamps = pruneTimestamps(timestamps, now, windowMs);
 
   if (validTimestamps.length >= maxAttempts) {
+    passwordResetAttempts.set(identifier, validTimestamps);
     return true;
   }
 
@@ -30,12 +156,13 @@ const isRateLimited = (identifier, maxAttempts = 5, windowMs = 15 * 60 * 1000) =
   return false;
 };
 
-const isLoginRateLimited = (identifier, maxAttempts = 10, windowMs = 15 * 60 * 1000) => {
+const isLoginRateLimited = (identifier, maxAttempts = 10, windowMs = RATE_LIMIT_WINDOW_MS) => {
   const now = Date.now();
   const timestamps = loginAttempts.get(identifier) || [];
-  const validTimestamps = timestamps.filter((t) => now - t < windowMs);
+  const validTimestamps = pruneTimestamps(timestamps, now, windowMs);
 
   if (validTimestamps.length >= maxAttempts) {
+    loginAttempts.set(identifier, validTimestamps);
     return true;
   }
 
@@ -56,6 +183,7 @@ const clearLoginAttempts = (identifier) => {
 const _resetRateLimits = () => {
   passwordResetAttempts.clear();
   loginAttempts.clear();
+  inFlightPasswordResets.clear();
 };
 
 const isDbConnected = () => mongoose.connection.readyState === 1;
@@ -741,43 +869,66 @@ const forgotPassword = async (req, res) => {
       `[SAFE_DIAGNOSTIC] Stage 1: Forgot-password request received for masked address: ${maskEmail(normalizedEmail)}`
     );
 
-    // Rate limiting guard (5 requests per 15 minutes by IP or Email)
-    const clientIp = req.ip || req.headers["x-forwarded-for"] || "ip-unknown";
-    if (isRateLimited(`ip:${clientIp}`) || isRateLimited(`email:${normalizedEmail}`)) {
-      console.warn(`[SAFE_DIAGNOSTIC] Stage 1: Rate limit triggered for IP or email.`);
-      return res.status(429).json({
-        success: false,
-        message: "Too many password reset requests. Please wait 15 minutes before trying again.",
-      });
-    }
-
-    // Stage 2: Database Connection Readiness Check
-    if (!isDbConnected()) {
-      console.error(
-        "[SAFE_DIAGNOSTIC] Stage 2: Database connection not ready (readyState !== 1). Returning 503 Service Unavailable."
-      );
-      return res.status(503).json({
-        success: false,
-        message: "Database service is temporarily unavailable. Please retry shortly.",
-      });
-    }
-    console.log("[SAFE_DIAGNOSTIC] Stage 2: Database connection readiness check PASSED.");
-
-    // Stage 3: Account Lookup & Anti-Enumeration Protection
-    const user = await User.findOne({ email: normalizedEmail });
-
     // Anti-enumeration generic response (consistent whether user exists or not)
     const genericResponse = {
       success: true,
       message: "If an account exists for this email, password reset instructions will be sent.",
     };
 
-    if (!user) {
+    // Client IP extraction: uses reverse proxy aware extractIpAddress
+    const clientIp = extractIpAddress(req) || "unknown";
+
+    // In-flight concurrent duplicate request check (handles rapid double clicks without burning tokens)
+    if (inFlightPasswordResets.has(normalizedEmail)) {
       console.log(
-        "[SAFE_DIAGNOSTIC] Stage 3: Account lookup completed. No account matched. Returning generic anti-enumeration response."
+        `[SAFE_DIAGNOSTIC] Stage 1: Concurrent in-flight request active for ${maskEmail(normalizedEmail)}. Returning anti-enumeration response without double-processing.`
       );
       return res.status(200).json(genericResponse);
     }
+
+    // Differentiated Rate Limiting Guard:
+    // - 5 attempts per 15 min per email (protects individual account inboxes from flooding)
+    // - 30 attempts per 15 min per IP (accommodates shared hospital/clinic networks & stops automated bot enumeration)
+    const rateCheck = checkForgotPasswordRateLimit({
+      email: normalizedEmail,
+      clientIp,
+    });
+
+    if (rateCheck.limited) {
+      console.warn(
+        `[SAFE_DIAGNOSTIC] Stage 1: Rate limit triggered by ${rateCheck.triggerType} for [${rateCheck.maskedKey}]. Attempts: ${rateCheck.count}/${rateCheck.max}. Retry-After: ${rateCheck.retryAfterSeconds}s. Client IP: ${maskIp(clientIp)}`
+      );
+      res.set("Retry-After", String(rateCheck.retryAfterSeconds));
+      return res.status(429).json({
+        success: false,
+        message: "Too many password reset requests. Please wait 15 minutes before trying again.",
+        retryAfter: rateCheck.retryAfterSeconds,
+      });
+    }
+
+    inFlightPasswordResets.add(normalizedEmail);
+    try {
+      // Stage 2: Database Connection Readiness Check
+      if (!isDbConnected()) {
+        console.error(
+          "[SAFE_DIAGNOSTIC] Stage 2: Database connection not ready (readyState !== 1). Returning 503 Service Unavailable."
+        );
+        return res.status(503).json({
+          success: false,
+          message: "Database service is temporarily unavailable. Please retry shortly.",
+        });
+      }
+      console.log("[SAFE_DIAGNOSTIC] Stage 2: Database connection readiness check PASSED.");
+
+      // Stage 3: Account Lookup & Anti-Enumeration Protection
+      const user = await User.findOne({ email: normalizedEmail });
+
+      if (!user) {
+        console.log(
+          "[SAFE_DIAGNOSTIC] Stage 3: Account lookup completed. No account matched. Returning generic anti-enumeration response."
+        );
+        return res.status(200).json(genericResponse);
+      }
     console.log(
       `[SAFE_DIAGNOSTIC] Stage 3: Account lookup completed. Account found (Role: ${user.role}). Proceeding with single-use token generation.`
     );
@@ -887,13 +1038,16 @@ const forgotPassword = async (req, res) => {
         ? { devResetUrl: resetUrl }
         : {}),
     });
-  } catch (error) {
-    console.error("[SAFE_DIAGNOSTIC] Forgot Password Error:", error.message);
-    return res.status(500).json({
-      success: false,
-      message: "An internal server error occurred while processing your request.",
-    });
+  } finally {
+    inFlightPasswordResets.delete(normalizedEmail);
   }
+} catch (error) {
+  console.error("[SAFE_DIAGNOSTIC] Forgot Password Error:", error.message);
+  return res.status(500).json({
+    success: false,
+    message: "An internal server error occurred while processing your request.",
+  });
+}
 };
 
 // ==========================================
@@ -1044,4 +1198,8 @@ module.exports = {
   DEPLOYED_FRONTEND_URL,
   isDbConnected,
   maskEmail,
+  checkForgotPasswordRateLimit,
+  sweepStaleRateLimits,
+  pruneTimestamps,
+  isRateLimited,
 };

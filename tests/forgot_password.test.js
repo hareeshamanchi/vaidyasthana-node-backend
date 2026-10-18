@@ -12,7 +12,14 @@ const {
   DEPLOYED_FRONTEND_URL,
   isDbConnected,
   maskEmail,
+  checkForgotPasswordRateLimit,
+  sweepStaleRateLimits,
+  pruneTimestamps,
 } = require("../src/controllers/authController");
+const {
+  extractIpAddress,
+  maskIp,
+} = require("../src/services/auditService");
 const {
   isEmailConfigured,
   getSmtpConfig,
@@ -123,6 +130,8 @@ const runSuite = async () => {
     _resetRateLimits();
     const spamEmail = `spam_${TEST_TIMESTAMP}@vaidyasthana.com`;
     let hitLimit = false;
+    let rateLimitResponseData = null;
+    let retryAfterHeader = null;
     for (let i = 0; i < 7; i++) {
       const res = await fetch(`${baseUrl}/api/auth/forgot-password`, {
         method: "POST",
@@ -131,10 +140,22 @@ const runSuite = async () => {
       });
       if (res.status === 429) {
         hitLimit = true;
+        rateLimitResponseData = await res.json();
+        retryAfterHeader = res.headers.get("Retry-After");
         break;
       }
     }
     assert.strictEqual(hitLimit, true);
+    assert.ok(retryAfterHeader, "Retry-After header should be returned with HTTP 429");
+    assert.strictEqual(rateLimitResponseData.success, false);
+    assert.strictEqual(
+      rateLimitResponseData.message,
+      "Too many password reset requests. Please wait 15 minutes before trying again."
+    );
+    assert.ok(
+      typeof rateLimitResponseData.retryAfter === "number" && rateLimitResponseData.retryAfter > 0,
+      "retryAfter field must be a positive integer"
+    );
     _resetRateLimits();
     console.log("✔ PASSED");
 
@@ -278,8 +299,16 @@ const runSuite = async () => {
     console.log("Testing 10: Email service safe unconfigured report... ");
     const originalHost = process.env.SMTP_HOST;
     const originalResendKey = process.env.RESEND_API_KEY;
+    const originalGmailSender = process.env.GMAIL_SENDER_ADDRESS;
+    const originalGoogleClientId = process.env.GOOGLE_CLIENT_ID;
+    const originalGmailRefreshToken = process.env.GMAIL_REFRESH_TOKEN;
+
     delete process.env.SMTP_HOST;
     delete process.env.RESEND_API_KEY;
+    delete process.env.GMAIL_SENDER_ADDRESS;
+    delete process.env.GOOGLE_CLIENT_ID;
+    delete process.env.GMAIL_REFRESH_TOKEN;
+
     assert.strictEqual(isEmailConfigured(), false);
     const emailRes = await sendPasswordResetEmail({
       to: "test@example.com",
@@ -289,7 +318,7 @@ const runSuite = async () => {
     assert.strictEqual(emailRes.delivered, false);
     assert.strictEqual(emailRes.reason, "EMAIL_NOT_CONFIGURED");
 
-    // In production environment without RESEND_API_KEY, safely returns RESEND_NOT_CONFIGURED
+    // In production environment without RESEND_API_KEY or Gmail, safely returns RESEND_NOT_CONFIGURED
     const origEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = "production";
     const prodEmailRes = await sendPasswordResetEmail({
@@ -303,6 +332,9 @@ const runSuite = async () => {
 
     if (originalHost) process.env.SMTP_HOST = originalHost;
     if (originalResendKey) process.env.RESEND_API_KEY = originalResendKey;
+    if (originalGmailSender) process.env.GMAIL_SENDER_ADDRESS = originalGmailSender;
+    if (originalGoogleClientId) process.env.GOOGLE_CLIENT_ID = originalGoogleClientId;
+    if (originalGmailRefreshToken) process.env.GMAIL_REFRESH_TOKEN = originalGmailRefreshToken;
     console.log("✔ PASSED");
 
     // Test 11: Production reset URL enforcement & localhost/LAN IP protection
@@ -459,8 +491,159 @@ const runSuite = async () => {
     if (savedMongoUri) process.env.MONGO_URI = savedMongoUri;
     console.log("✔ PASSED");
 
+    // Test 18: Shared-IP behavior behind Render reverse proxy (no false-positive lockout)
+    console.log("Testing 18: Shared-IP behavior behind Render proxy (differentiated email vs IP thresholds)... ");
+    _resetRateLimits();
+    const sharedClinicIp = "198.51.100.77";
+
+    // 8 distinct users from the same clinic IP make password reset requests
+    for (let i = 1; i <= 8; i++) {
+      const distinctEmail = `clinic_patient_${i}_${TEST_TIMESTAMP}@vaidyasthana.com`;
+      const resClinic = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Forwarded-For": `${sharedClinicIp}, 10.0.0.1`,
+        },
+        body: JSON.stringify({ email: distinctEmail }),
+      });
+      assert.strictEqual(
+        resClinic.status,
+        200,
+        `User ${i} on shared IP should succeed (status 200), but received ${resClinic.status}`
+      );
+    }
+
+    // Now, single user from that same shared IP exceeds their individual 5-request limit
+    const singleUserSpam = `single_user_spam_${TEST_TIMESTAMP}@vaidyasthana.com`;
+    // We already did 0 for this user. First 5 requests must succeed:
+    for (let i = 1; i <= 5; i++) {
+      const resSingle = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Forwarded-For": `${sharedClinicIp}, 10.0.0.1`,
+        },
+        body: JSON.stringify({ email: singleUserSpam }),
+      });
+      assert.strictEqual(resSingle.status, 200);
+    }
+    // 6th request for this specific email MUST trigger 429
+    const resBlocked = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Forwarded-For": `${sharedClinicIp}, 10.0.0.1`,
+      },
+      body: JSON.stringify({ email: singleUserSpam }),
+    });
+    assert.strictEqual(resBlocked.status, 429, "6th attempt for same email must be rate-limited with HTTP 429");
+    const blockedData = await resBlocked.json();
+    assert.strictEqual(blockedData.success, false);
+    assert.ok(resBlocked.headers.get("Retry-After"), "Must provide Retry-After header");
+
+    // But a BRAND NEW user from the same IP should STILL succeed because the IP quota (30) is not reached!
+    const brandNewUser = `brand_new_patient_${TEST_TIMESTAMP}@vaidyasthana.com`;
+    const resBrandNew = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Forwarded-For": `${sharedClinicIp}, 10.0.0.1`,
+      },
+      body: JSON.stringify({ email: brandNewUser }),
+    });
+    assert.strictEqual(
+      resBrandNew.status,
+      200,
+      "Newly registered user on shared clinic IP must NOT be blocked (avoids false-positive 429)"
+    );
+    _resetRateLimits();
+    console.log("✔ PASSED");
+
+    // Test 19: Express trust proxy & reverse proxy IP extraction and masking
+    console.log("Testing 19: Reverse proxy IP extraction and PII masking... ");
+    // CF-Connecting-IP priority
+    const mockReqCf = {
+      headers: { "cf-connecting-ip": "198.51.100.15", "x-forwarded-for": "10.0.0.2" },
+      ip: "10.0.0.3",
+    };
+    assert.strictEqual(extractIpAddress(mockReqCf), "198.51.100.15");
+
+    // X-Real-IP
+    const mockReqReal = {
+      headers: { "x-real-ip": "198.51.100.22" },
+      ip: "10.0.0.3",
+    };
+    assert.strictEqual(extractIpAddress(mockReqReal), "198.51.100.22");
+
+    // Multi-hop X-Forwarded-For (client, proxy1, proxy2)
+    const mockReqFwd = {
+      headers: { "x-forwarded-for": "203.0.113.88, 10.142.0.1, 10.142.0.2" },
+      ip: "10.142.0.2",
+    };
+    assert.strictEqual(extractIpAddress(mockReqFwd), "203.0.113.88");
+
+    // Strips ::ffff:
+    const mockReqV6 = {
+      headers: {},
+      ip: "::ffff:192.0.2.99",
+    };
+    assert.strictEqual(extractIpAddress(mockReqV6), "192.0.2.99");
+
+    // Masking tests
+    assert.strictEqual(maskIp("198.51.100.42"), "198.51.***.***");
+    assert.strictEqual(maskIp("2001:db8:85a3::8a2e:370:7334"), "2001:db8:****");
+    assert.strictEqual(maskIp("127.0.0.1"), "127.0.0.***");
+    console.log("✔ PASSED");
+
+    // Test 20: Stale rate limit counter cleanup & memory leak prevention
+    console.log("Testing 20: Stale rate limit cleanup & memory leak prevention... ");
+    const now = Date.now();
+    const staleTime = now - 20 * 60 * 1000; // 20 minutes ago (expired)
+    const freshTime = now - 2 * 60 * 1000; // 2 minutes ago (valid)
+
+    const pruned = pruneTimestamps([staleTime, freshTime], now, 15 * 60 * 1000);
+    assert.strictEqual(pruned.length, 1);
+    assert.strictEqual(pruned[0], freshTime);
+
+    // Verify sweepStaleRateLimits cleans up maps
+    checkForgotPasswordRateLimit({ email: "olduser@vaidyasthana.com", clientIp: "192.0.2.1", now: staleTime });
+    sweepStaleRateLimits(now);
+    // After sweeping at `now`, an entry from 20 minutes ago will have no valid timestamps and is deleted
+    const checkAfterSweep = checkForgotPasswordRateLimit({
+      email: "olduser@vaidyasthana.com",
+      clientIp: "192.0.2.1",
+      now,
+    });
+    // Fresh attempt was allowed (not limited)
+    assert.strictEqual(checkAfterSweep.limited, false);
+    _resetRateLimits();
+    console.log("✔ PASSED");
+
+    // Test 21: In-flight duplicate request debouncing
+    console.log("Testing 21: In-flight request debouncing and double-click safety... ");
+    _resetRateLimits();
+    const concurrentEmail = `concurrent_${TEST_TIMESTAMP}@vaidyasthana.com`;
+    // Fire two requests concurrently
+    const [reqA, reqB] = await Promise.all([
+      fetch(`${baseUrl}/api/auth/forgot-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: concurrentEmail }),
+      }),
+      fetch(`${baseUrl}/api/auth/forgot-password`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: concurrentEmail }),
+      }),
+    ]);
+    assert.strictEqual(reqA.status, 200);
+    assert.strictEqual(reqB.status, 200);
+    _resetRateLimits();
+    console.log("✔ PASSED");
+
     console.log("\n=================================================");
-    console.log("  ALL 17 FORGOT & RESET PASSWORD TESTS PASSED!   ");
+    console.log("  ALL 21 FORGOT & RESET PASSWORD TESTS PASSED!   ");
     console.log("=================================================\n");
   } catch (err) {
     console.error("\n❌ TEST ENCOUNTERED AN ERROR:", err);

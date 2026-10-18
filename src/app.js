@@ -19,6 +19,16 @@ const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
 
+// Trust reverse proxy (Render, Cloudflare, AWS, etc.) so that req.ip and req.protocol accurately reflect the client
+const trustProxyEnv = process.env.TRUST_PROXY;
+if (trustProxyEnv) {
+  const parsed = parseInt(trustProxyEnv, 10);
+  app.set("trust proxy", isNaN(parsed) ? trustProxyEnv : parsed);
+} else {
+  // On Render and common cloud hosts, trust 1 hop behind the reverse proxy
+  app.set("trust proxy", 1);
+}
+
 /*
 |--------------------------------------------------------------------------
 | CORS Configuration
