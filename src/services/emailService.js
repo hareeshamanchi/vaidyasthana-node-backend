@@ -1,5 +1,17 @@
 const { Resend } = require("resend");
 const nodemailer = require("nodemailer");
+const { google } = require("googleapis");
+const crypto = require("crypto");
+const mongoose = require("mongoose");
+const EmailIntegration = require("../models/EmailIntegration");
+const {
+  getGoogleOAuthConfig,
+  createOAuth2Client,
+  getStoredRefreshToken,
+  isGmailOAuthAuthorizedSync,
+  isGmailOAuthAuthorized,
+  maskEmail,
+} = require("./gmailOAuthService");
 
 /**
  * Strips enclosing quotes (double or single) from an environment variable value
@@ -98,12 +110,15 @@ const getSmtpConfig = () => {
 };
 
 /**
- * Checks whether an outbound email transport (Resend or SMTP) is configured.
- * In production on Render/cloud hosts, strictly requires RESEND_API_KEY.
+ * Checks whether an outbound email transport (Gmail OAuth2, Resend, or SMTP) is configured.
+ * In production on Render/cloud hosts, requires either authorized Gmail OAuth or Resend.
  *
  * @returns {boolean}
  */
 const isEmailConfigured = () => {
+  if (isGmailOAuthAuthorizedSync()) {
+    return true;
+  }
   const resendConfig = getResendConfig();
   if (resendConfig.configured) {
     return true;
@@ -115,7 +130,7 @@ const isEmailConfigured = () => {
     Boolean(process.env.RENDER_INSTANCE_ID);
 
   if (isProd) {
-    return false; // In production, require Resend
+    return false; // In production, require Gmail OAuth or Resend
   }
 
   // Development/Test fallback
@@ -125,9 +140,12 @@ const isEmailConfigured = () => {
 /**
  * Determines which email provider is currently active.
  *
- * @returns {'RESEND' | 'SMTP' | 'NONE'}
+ * @returns {'GMAIL_OAUTH2' | 'RESEND' | 'SMTP' | 'NONE'}
  */
 const getEmailProvider = () => {
+  if (isGmailOAuthAuthorizedSync()) {
+    return "GMAIL_OAUTH2";
+  }
   if (getResendConfig().configured) {
     return "RESEND";
   }
@@ -338,6 +356,8 @@ const isTestPlaceholderEmail = (email) => {
 
   return (
     domain === "vaidyasthana.com" ||
+    domain === "vaidyasthana.internal" ||
+    domain.endsWith(".internal") ||
     domain === "example.com" ||
     domain === "example.org" ||
     domain === "test.com" ||
@@ -346,8 +366,260 @@ const isTestPlaceholderEmail = (email) => {
     localPart.startsWith("reset_doctor_") ||
     localPart.startsWith("test_patient_") ||
     localPart.startsWith("test_doctor_") ||
+    localPart.startsWith("patient.e2e.") ||
     localPart.startsWith("spam_")
   );
+};
+
+/**
+ * Constructs an RFC 2822 / RFC 5322 formatted email and returns a base64url-encoded string
+ * suitable for the Google Gmail API (users.messages.send).
+ *
+ * @param {Object} options
+ * @param {string} options.from - Sender header (e.g. '"Vaidyasthana Healthcare" <sender@gmail.com>')
+ * @param {string} options.to - Recipient header (e.g. 'patient@example.com')
+ * @param {string} options.subject - Email subject
+ * @param {string} options.text - Plain text content
+ * @param {string} options.html - HTML content
+ * @returns {string} URL-safe base64 encoded MIME message
+ */
+const buildRfc2822Message = ({ from, to, subject, text, html }) => {
+  const boundary = `----=_Part_${Date.now()}_${crypto.randomBytes(8).toString("hex")}`;
+  const encodedSubject = `=?UTF-8?B?${Buffer.from(subject, "utf8").toString("base64")}?=`;
+  const messageId = `<${Date.now()}.${crypto.randomBytes(8).toString("hex")}@vaidyasthana.health>`;
+
+  const headers = [
+    `From: ${from}`,
+    `To: ${to}`,
+    `Subject: ${encodedSubject}`,
+    `Message-ID: ${messageId}`,
+    `Date: ${new Date().toUTCString()}`,
+    `MIME-Version: 1.0`,
+    `Content-Type: multipart/alternative; boundary="${boundary}"`,
+  ];
+
+  const body = [
+    `--${boundary}`,
+    `Content-Type: text/plain; charset=UTF-8`,
+    `Content-Transfer-Encoding: 7bit`,
+    ``,
+    text,
+    ``,
+    `--${boundary}`,
+    `Content-Type: text/html; charset=UTF-8`,
+    `Content-Transfer-Encoding: 7bit`,
+    ``,
+    html,
+    ``,
+    `--${boundary}--`,
+  ];
+
+  const rawMime = `${headers.join("\r\n")}\r\n\r\n${body.join("\r\n")}`;
+  return Buffer.from(rawMime, "utf8").toString("base64url");
+};
+
+/**
+ * Sends a password reset email via Google Gmail API.
+ * Uses the authorized OAuth2 refresh token and official googleapis client.
+ *
+ * @param {Object} options
+ * @param {string} options.to - Recipient email address
+ * @param {string} options.name - Recipient user's display name
+ * @param {string} options.resetUrl - Full password reset URL
+ * @param {number} [options.expiresInMinutes=15] - Expiry in minutes
+ * @param {Object} [options.injectedGmailClient] - Injected mock client for unit testing
+ * @returns {Promise<{
+ *   accepted: boolean,
+ *   delivered: boolean,
+ *   providerAccepted: boolean,
+ *   provider: 'GMAIL_OAUTH2',
+ *   messageId?: string,
+ *   reason: string,
+ *   deliveryNote?: string,
+ *   diagnosticMessage?: string
+ * }>}
+ */
+const sendViaGmailOAuth = async ({
+  to,
+  name,
+  resetUrl,
+  expiresInMinutes = 15,
+  injectedGmailClient,
+}) => {
+  const config = getGoogleOAuthConfig();
+
+  if (!config.configured) {
+    console.warn(
+      `[SAFE_DIAGNOSTIC] Gmail OAuth service is not configured (missing: ${config.missingVars.join(
+        ", "
+      )}). Password reset email could not be dispatched.`
+    );
+    return {
+      accepted: false,
+      delivered: false,
+      providerAccepted: false,
+      provider: "GMAIL_OAUTH2",
+      reason: "GMAIL_NOT_CONFIGURED",
+      diagnosticMessage: `Google OAuth environment variables missing: ${config.missingVars.join(
+        ", "
+      )}`,
+    };
+  }
+
+  // Verify stored integration status and sender identity before dispatch
+  const refreshToken = await getStoredRefreshToken(config.senderAddress);
+  if (!refreshToken) {
+    console.warn(
+      `[SAFE_DIAGNOSTIC] Gmail OAuth integration for sender ${maskEmail(
+        config.senderAddress
+      )} is not authorized (no active refresh token found).`
+    );
+    return {
+      accepted: false,
+      delivered: false,
+      providerAccepted: false,
+      provider: "GMAIL_OAUTH2",
+      reason: "GMAIL_NOT_AUTHORIZED",
+      diagnosticMessage: `Sender ${maskEmail(
+        config.senderAddress
+      )} is not authorized with a Google refresh token. Please authorize via /api/auth/google/authorize.`,
+    };
+  }
+
+  // Intercept test fixture / placeholder emails to avoid outbound bounces in automated tests (unless injected mock client provided)
+  if (!injectedGmailClient && isTestPlaceholderEmail(to)) {
+    console.log(
+      `[SAFE_DIAGNOSTIC] Email address (${maskEmail(
+        to
+      )}) is recognized as an internal test placeholder. Bypassing live outbound Gmail dispatch.`
+    );
+    return {
+      accepted: true,
+      delivered: false,
+      providerAccepted: true,
+      provider: "GMAIL_OAUTH2",
+      messageId: `<gmail-mock-${Date.now()}@vaidyasthana.internal>`,
+      reason: "TEST_FIXTURE_BYPASS",
+      deliveryNote: "Test fixture email bypassed live outbound dispatch.",
+    };
+  }
+
+  try {
+    const senderAddress = config.senderAddress;
+    const fromAddress = `"Vaidyasthana Healthcare" <${senderAddress}>`;
+    const subject = "Vaidyasthana - Password Reset Request";
+
+    const htmlContent = generatePasswordResetEmailHtml({
+      name,
+      resetUrl,
+      expiresInMinutes,
+    });
+
+    const textContent = `Hello ${name || "User"},\n\nWe received a request to reset your Vaidyasthana account password.\n\nPlease visit this link to choose a new password:\n${resetUrl}\n\nThis link is valid for ${expiresInMinutes} minutes.\nIf you did not request this, please disregard this email.\n\n— Vaidyasthana Healthcare Team`;
+
+    const rawEncoded = buildRfc2822Message({
+      from: fromAddress,
+      to,
+      subject,
+      text: textContent,
+      html: htmlContent,
+    });
+
+    console.log(
+      `[SAFE_DIAGNOSTIC] Initializing Gmail API Dispatch -> Sender: ${maskEmail(
+        senderAddress
+      )}, Recipient: ${maskEmail(to)}`
+    );
+
+    let response;
+    if (injectedGmailClient) {
+      response = await injectedGmailClient.users.messages.send({
+        userId: "me",
+        requestBody: { raw: rawEncoded },
+      });
+    } else {
+      const oauth2Client = createOAuth2Client();
+      oauth2Client.setCredentials({
+        refresh_token: refreshToken,
+      });
+
+      const gmail = google.gmail({ version: "v1", auth: oauth2Client });
+      response = await gmail.users.messages.send({
+        userId: "me",
+        requestBody: { raw: rawEncoded },
+      });
+    }
+
+    const messageId =
+      response?.data?.id || `<gmail-${Date.now()}@vaidyasthana.internal>`;
+
+    console.log(
+      `[SAFE_DIAGNOSTIC] Password reset email accepted by Gmail API. Message ID: ${messageId}. Status: Upstream Accepted.`
+    );
+
+    return {
+      accepted: true,
+      delivered: false, // Upstream accepted; final inbox delivery is asynchronous
+      providerAccepted: true,
+      provider: "GMAIL_OAUTH2",
+      messageId,
+      reason: "PROVIDER_ACCEPTED",
+      deliveryNote:
+        "Gmail API accepted message for delivery. Final delivery handled by Google mail infrastructure.",
+    };
+  } catch (error) {
+    const errMsg = (error.message || "").toLowerCase();
+    const statusCode = error.status || error.code || 0;
+    let reason = "GMAIL_TRANSMISSION_ERROR";
+    let diagnosticMessage = error.message || "Failed to dispatch email via Gmail API.";
+
+    if (
+      errMsg.includes("invalid_grant") ||
+      errMsg.includes("token has been expired or revoked") ||
+      errMsg.includes("bad request")
+    ) {
+      reason = "GMAIL_TOKEN_REVOKED";
+      diagnosticMessage =
+        "Gmail OAuth refresh token is invalid or has been revoked. Please re-authorize via /api/auth/google/authorize.";
+
+      if (mongoose.connection.readyState === 1) {
+        EmailIntegration.updateOne(
+          { provider: "GMAIL_OAUTH2", senderAddress: config.senderAddress },
+          { status: "expired" }
+        ).catch(() => {});
+      }
+    } else if (
+      statusCode === 429 ||
+      errMsg.includes("quota") ||
+      errMsg.includes("rate limit") ||
+      errMsg.includes("user rate limit")
+    ) {
+      reason = "GMAIL_QUOTA_EXCEEDED";
+      diagnosticMessage =
+        "Gmail API rate limit or daily sending quota reached. Please retry after a brief delay.";
+    } else if (
+      errMsg.includes("timeout") ||
+      errMsg.includes("network") ||
+      errMsg.includes("econnreset") ||
+      errMsg.includes("fetch failed")
+    ) {
+      reason = "GMAIL_NETWORK_TIMEOUT";
+      diagnosticMessage = "Network timeout communicating with Google Gmail API.";
+    }
+
+    console.error(
+      `[SAFE_DIAGNOSTIC] Gmail API Transmission Failed: [${reason}] ${diagnosticMessage}`
+    );
+
+    return {
+      accepted: false,
+      delivered: false,
+      providerAccepted: false,
+      provider: "GMAIL_OAUTH2",
+      reason,
+      diagnosticMessage,
+    };
+  }
 };
 
 /**
@@ -716,20 +988,43 @@ const sendViaSmtp = async ({ to, name, resetUrl, expiresInMinutes = 15 }) => {
 
 /**
  * Sends a password reset email using the configured outbound email transport.
- * Prefers Resend HTTPS API in all environments, and strictly mandates Resend in production.
+ * Priority order:
+ *  1. Google Gmail API (via authorized OAuth 2.0 refresh token)
+ *  2. Resend HTTPS API (if configured and no authorized Gmail integration)
+ *  3. Local SMTP (development / test fallback only)
  *
  * @param {Object} options
  * @param {string} options.to - Real recipient email address
  * @param {string} options.name - Recipient user's name
  * @param {string} options.resetUrl - Full password reset URL with single-use token
  * @param {number} [options.expiresInMinutes=15] - Expiration duration in minutes
+ * @param {Object} [options.injectedGmailClient] - Injected mock client for unit testing
  * @returns {Promise<{ accepted: boolean, delivered: boolean, providerAccepted: boolean, provider: string, messageId?: string, reason?: string, missingEnv?: string[], acceptedRecipients?: string[], rejected?: string[], smtpAccepted?: boolean, inboxDeliveryGuaranteed?: boolean, deliveryNote?: string, diagnosticMessage?: string }>}
  */
-const sendPasswordResetEmail = async (options) => {
-  const resendConfig = getResendConfig();
+const sendPasswordResetEmail = async (options = {}) => {
+  // Priority 1: Check Gmail OAuth 2.0 (via authorized refresh token)
+  const gmailConfig = getGoogleOAuthConfig();
+  if (gmailConfig.configured) {
+    const refreshToken = await getStoredRefreshToken(gmailConfig.senderAddress);
+    if (refreshToken) {
+      console.log(
+        `[SAFE_DIAGNOSTIC] Priority 1 Transport: Authorized Gmail OAuth 2.0 active for sender ${maskEmail(
+          gmailConfig.senderAddress
+        )}. Routing password reset email via Gmail API.`
+      );
+      // NOTE: Requirement 7: Never silently fall back to Resend testing domain if Gmail fails.
+      return await sendViaGmailOAuth(options);
+    }
+  }
 
-  // Primary: If RESEND_API_KEY is configured, use Resend
+  // Priority 2: Resend HTTPS API (if RESEND_API_KEY is configured and no Gmail OAuth is authorized)
+  const resendConfig = getResendConfig();
   if (resendConfig.configured) {
+    if (gmailConfig.configured) {
+      console.warn(
+        `[SAFE_DIAGNOSTIC] Gmail OAuth credentials exist in environment but sender is not authorized yet (no active refresh token). Falling back to Resend.`
+      );
+    }
     return await sendViaResend(options);
   }
 
@@ -742,7 +1037,7 @@ const sendPasswordResetEmail = async (options) => {
   // In production, strictly reject unauthenticated or SMTP fallbacks
   if (isProd) {
     console.error(
-      `[SAFE_DIAGNOSTIC] Production email dispatch failed: RESEND_API_KEY is not configured in production environment. Refusing unauthenticated or local fallback.`
+      `[SAFE_DIAGNOSTIC] Production email dispatch failed: Neither Gmail OAuth nor Resend is authorized/configured. Refusing unauthenticated or local fallback.`
     );
     return {
       accepted: false,
@@ -750,22 +1045,24 @@ const sendPasswordResetEmail = async (options) => {
       providerAccepted: false,
       provider: "NONE",
       reason: "RESEND_NOT_CONFIGURED",
-      diagnosticMessage: "Resend API key is required in production environment.",
+      diagnosticMessage: gmailConfig.configured
+        ? "Gmail OAuth sender is configured but not authorized. Please authorize via /api/auth/google/authorize."
+        : "Resend API key is required in production environment.",
     };
   }
 
-  // Development/Test fallback to SMTP if configured
+  // Priority 3: Development/Test fallback to SMTP if configured
   const smtpConfig = getSmtpConfig();
   if (smtpConfig.configured) {
     console.log(
-      `[SAFE_DIAGNOSTIC] RESEND_API_KEY not set. Using local development SMTP Transport -> Host: ${smtpConfig.host}, Port: ${smtpConfig.port}`
+      `[SAFE_DIAGNOSTIC] Using local development SMTP Transport -> Host: ${smtpConfig.host}, Port: ${smtpConfig.port}`
     );
     return await sendViaSmtp(options);
   }
 
   // Neither configured
   console.warn(
-    `[SAFE_DIAGNOSTIC] No email transport configured (missing RESEND_API_KEY and SMTP credentials). Password reset email could not be dispatched.`
+    `[SAFE_DIAGNOSTIC] No email transport configured. Password reset email could not be dispatched.`
   );
   return {
     accepted: false,
@@ -783,8 +1080,10 @@ module.exports = {
   getResendConfig,
   getSmtpConfig,
   sendPasswordResetEmail,
+  sendViaGmailOAuth,
   sendViaResend,
   sendViaSmtp,
+  buildRfc2822Message,
   isTestPlaceholderEmail,
   generatePasswordResetEmailHtml,
   maskSecret,

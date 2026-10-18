@@ -253,6 +253,9 @@ const runResendTestSuite = async () => {
     console.log("Testing 10: Production fail-safe without RESEND_API_KEY... ");
     process.env.NODE_ENV = "production";
     delete process.env.RESEND_API_KEY;
+    delete process.env.GOOGLE_CLIENT_ID;
+    delete process.env.GOOGLE_CLIENT_SECRET;
+    delete process.env.GMAIL_SENDER_ADDRESS;
     // Set dummy SMTP credentials that must NOT be used in production
     process.env.SMTP_HOST = "smtp.gmail.com";
     process.env.SMTP_USER = "user@gmail.com";

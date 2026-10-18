@@ -18,7 +18,18 @@ const {
   encryptSecret,
   decryptSecret,
   _resetOAuthStates,
+  _setInMemoryRefreshToken,
+  isGmailOAuthAuthorizedSync,
 } = require("../src/services/gmailOAuthService");
+const {
+  sendViaGmailOAuth,
+  sendPasswordResetEmail,
+  buildRfc2822Message,
+  isEmailConfigured,
+  getEmailProvider,
+} = require("../src/services/emailService");
+const User = require("../src/models/User");
+
 
 let server;
 let baseUrl;
@@ -454,8 +465,267 @@ const runTestSuite = async () => {
 
     console.log("✔ PASSED");
 
+    // -------------------------------------------------------------------
+    // Test 14: MIME Message Construction (buildRfc2822Message) & Dispatch
+    // -------------------------------------------------------------------
+    console.log("Testing 14: RFC 2822 MIME message construction & base64url encoding... ");
+    const mimeBase64 = buildRfc2822Message({
+      from: '"Vaidyasthana Healthcare" <vaidyasthana.clinical@gmail.com>',
+      to: "patient.anita@example.org",
+      subject: "Vaidyasthana - Password Reset Request",
+      text: "Plain text reset instructions",
+      html: "<p>HTML reset instructions</p>",
+    });
+
+    assert.strictEqual(typeof mimeBase64, "string");
+    // Decode from base64url and verify RFC 2822 headers
+    const decodedMime = Buffer.from(mimeBase64, "base64url").toString("utf8");
+    assert.ok(decodedMime.includes("From: \"Vaidyasthana Healthcare\" <vaidyasthana.clinical@gmail.com>"));
+    assert.ok(decodedMime.includes("To: patient.anita@example.org"));
+    assert.ok(decodedMime.includes("Subject: =?UTF-8?B?"));
+    assert.ok(decodedMime.includes("MIME-Version: 1.0"));
+    assert.ok(decodedMime.includes("Content-Type: multipart/alternative; boundary="));
+    assert.ok(decodedMime.includes("Plain text reset instructions"));
+    assert.ok(decodedMime.includes("<p>HTML reset instructions</p>"));
+
+    // Mock Gmail API client for successful message dispatch
+    let sentPayload = null;
+    const mockGmailClientSuccess = {
+      users: {
+        messages: {
+          send: async ({ userId, requestBody }) => {
+            sentPayload = { userId, requestBody };
+            return {
+              data: {
+                id: "gmail_msg_success_1234567890",
+                threadId: "gmail_thread_0987654321",
+                labelIds: ["SENT"],
+              },
+            };
+          },
+        },
+      },
+    };
+
+    _setInMemoryRefreshToken({
+      senderAddress: "vaidyasthana.clinical@gmail.com",
+      refreshToken: "1//04mock_valid_refresh_token_for_sending",
+    });
+
+    const gmailSendResult = await sendViaGmailOAuth({
+      to: "patient.anita@example.org",
+      name: "Anita Sharma",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/sample_token_xyz",
+      expiresInMinutes: 15,
+      injectedGmailClient: mockGmailClientSuccess,
+    });
+
+    assert.strictEqual(gmailSendResult.accepted, true);
+    assert.strictEqual(gmailSendResult.delivered, false);
+    assert.strictEqual(gmailSendResult.providerAccepted, true);
+    assert.strictEqual(gmailSendResult.provider, "GMAIL_OAUTH2");
+    assert.strictEqual(gmailSendResult.messageId, "gmail_msg_success_1234567890");
+    assert.strictEqual(gmailSendResult.reason, "PROVIDER_ACCEPTED");
+    assert.ok(sentPayload);
+    assert.strictEqual(sentPayload.userId, "me");
+    assert.ok(sentPayload.requestBody.raw);
+    console.log("✔ PASSED");
+
+    // -------------------------------------------------------------------
+    // Test 15: Outbound Provider Priority: Gmail OAuth Selected Over Resend
+    // -------------------------------------------------------------------
+    console.log("Testing 15: Outbound provider priority (Gmail OAuth prioritized over Resend)... ");
+    process.env.RESEND_API_KEY = "re_mock_resend_key_that_should_not_be_chosen";
+    process.env.GMAIL_SENDER_ADDRESS = "vaidyasthana.clinical@gmail.com";
+    _setInMemoryRefreshToken({
+      senderAddress: "vaidyasthana.clinical@gmail.com",
+      refreshToken: "1//04mock_active_refresh_token",
+    });
+
+    // isEmailConfigured and getEmailProvider check
+    assert.strictEqual(isEmailConfigured(), true);
+    assert.strictEqual(getEmailProvider(), "GMAIL_OAUTH2");
+
+    // sendPasswordResetEmail routes to Gmail OAuth
+    const routedResult = await sendPasswordResetEmail({
+      to: "patient.rohit@example.org",
+      name: "Rohit Verma",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/token123",
+      injectedGmailClient: mockGmailClientSuccess,
+    });
+
+    assert.strictEqual(routedResult.accepted, true);
+    assert.strictEqual(routedResult.provider, "GMAIL_OAUTH2");
+    assert.strictEqual(routedResult.messageId, "gmail_msg_success_1234567890");
+    console.log("✔ PASSED");
+
+    // -------------------------------------------------------------------
+    // Test 16: Gmail API Failure Handling (Token Revoked / invalid_grant)
+    // -------------------------------------------------------------------
+    console.log("Testing 16: Gmail API token revocation handling (invalid_grant) and non-fallback... ");
+    const mockGmailClientRevoked = {
+      users: {
+        messages: {
+          send: async () => {
+            const err = new Error("invalid_grant: Token has been expired or revoked.");
+            err.code = 400;
+            throw err;
+          },
+        },
+      },
+    };
+
+    // Even though RESEND_API_KEY is present, Requirement 7 mandates:
+    // Do NOT silently fall back to Resend testing domain for patient recipients!
+    const revokedResult = await sendPasswordResetEmail({
+      to: "patient.sunita@example.org",
+      name: "Sunita Patel",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/token456",
+      injectedGmailClient: mockGmailClientRevoked,
+    });
+
+    assert.strictEqual(revokedResult.accepted, false);
+    assert.strictEqual(revokedResult.providerAccepted, false);
+    assert.strictEqual(revokedResult.provider, "GMAIL_OAUTH2"); // Did NOT fall back to Resend!
+    assert.strictEqual(revokedResult.reason, "GMAIL_TOKEN_REVOKED");
+    assert.ok(revokedResult.diagnosticMessage.includes("re-authorize"));
+    console.log("✔ PASSED");
+
+    // -------------------------------------------------------------------
+    // Test 17: Gmail API Rate Limit / Quota Exceeded Handling
+    // -------------------------------------------------------------------
+    console.log("Testing 17: Gmail API quota / rate limit (429) handling... ");
+    _setInMemoryRefreshToken({
+      senderAddress: "vaidyasthana.clinical@gmail.com",
+      refreshToken: "1//04mock_valid_token_2",
+    });
+
+    const mockGmailClientQuota = {
+      users: {
+        messages: {
+          send: async () => {
+            const err = new Error("User Rate Limit Exceeded. Daily sending quota reached.");
+            err.status = 429;
+            throw err;
+          },
+        },
+      },
+    };
+
+    const quotaResult = await sendViaGmailOAuth({
+      to: "patient.amit@example.org",
+      name: "Amit Kumar",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/token789",
+      injectedGmailClient: mockGmailClientQuota,
+    });
+
+    assert.strictEqual(quotaResult.accepted, false);
+    assert.strictEqual(quotaResult.provider, "GMAIL_OAUTH2");
+    assert.strictEqual(quotaResult.reason, "GMAIL_QUOTA_EXCEEDED");
+    console.log("✔ PASSED");
+
+    // -------------------------------------------------------------------
+    // Test 18: Missing or Unauthorized Refresh Token Safe Rejection
+    // -------------------------------------------------------------------
+    console.log("Testing 18: Missing or unauthorized refresh token handling... ");
+    _resetOAuthStates(); // Clears in-memory cache
+    if (mongoose.connection.readyState === 1) {
+      await mongoose.model("EmailIntegration").deleteMany({ provider: "GMAIL_OAUTH2" });
+    }
+
+    const unauthResult = await sendViaGmailOAuth({
+      to: "patient.deepa@example.org",
+      name: "Deepa Nair",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/unauth123",
+      injectedGmailClient: mockGmailClientSuccess,
+    });
+
+    assert.strictEqual(unauthResult.accepted, false);
+    assert.strictEqual(unauthResult.reason, "GMAIL_NOT_AUTHORIZED");
+    console.log("✔ PASSED");
+
+    // -------------------------------------------------------------------
+    // Test 19: Sender Identity Mismatch Protection
+    // -------------------------------------------------------------------
+    console.log("Testing 19: Sender identity mismatch protection... ");
+    _setInMemoryRefreshToken({
+      senderAddress: "old.authorized.doctor@gmail.com",
+      refreshToken: "1//04mock_token_for_old_account",
+    });
+    // Environment configured with a different sender address
+    process.env.GMAIL_SENDER_ADDRESS = "vaidyasthana.clinical@gmail.com";
+
+    const mismatchSendResult = await sendViaGmailOAuth({
+      to: "patient@example.org",
+      name: "Patient",
+      resetUrl: "https://vaidyasthana-frontend.onrender.com/reset-password/mismatch123",
+      injectedGmailClient: mockGmailClientSuccess,
+    });
+
+    assert.strictEqual(mismatchSendResult.accepted, false);
+    assert.strictEqual(mismatchSendResult.reason, "GMAIL_NOT_AUTHORIZED");
+    console.log("✔ PASSED");
+
+    // -------------------------------------------------------------------
+    // Test 20: Full End-to-End Forgot-Password Route with Gmail OAuth Active
+    // -------------------------------------------------------------------
+    console.log("Testing 20: Full POST /api/auth/forgot-password route integration... ");
+    process.env.GMAIL_SENDER_ADDRESS = "vaidyasthana.clinical@gmail.com";
+    _setInMemoryRefreshToken({
+      senderAddress: "vaidyasthana.clinical@gmail.com",
+      refreshToken: "1//04mock_verified_e2e_token",
+    });
+
+    // Ensure a test user exists in Atlas
+    const testEmail = `patient.e2e.${Date.now()}@vaidyasthana.internal`;
+    if (mongoose.connection.readyState === 1) {
+      await User.findOneAndUpdate(
+        { email: testEmail },
+        {
+          name: "E2E Test Patient",
+          email: testEmail,
+          password: "HashedPassword123!",
+          role: "patient",
+          status: "active",
+          phoneNumber: "9876543210",
+          address: "123 Clinical Way",
+        },
+        { upsert: true, returnDocument: "after" }
+      );
+    }
+
+    const resForgotPassword = await fetch(`${baseUrl}/api/auth/forgot-password`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: testEmail }),
+    });
+
+    assert.strictEqual(resForgotPassword.status, 200);
+    const dataForgot = await resForgotPassword.json();
+    assert.strictEqual(dataForgot.success, true);
+    assert.strictEqual(
+      dataForgot.message,
+      "If an account exists for this email, password reset instructions will be sent."
+    );
+    assert.strictEqual(dataForgot.emailDelivery.configured, true);
+    assert.strictEqual(dataForgot.emailDelivery.provider, "GMAIL_OAUTH2");
+    assert.strictEqual(dataForgot.emailDelivery.accepted, true);
+
+    // Verify token was hashed with SHA-256 and has future expiry in MongoDB Atlas
+    if (mongoose.connection.readyState === 1) {
+      const dbUser = await User.findOne({ email: testEmail });
+      assert.ok(dbUser);
+      assert.ok(dbUser.resetPasswordToken);
+      assert.strictEqual(dbUser.resetPasswordToken.length, 64); // SHA-256 hex is 64 chars
+      assert.ok(dbUser.resetPasswordExpires);
+      assert.ok(new Date(dbUser.resetPasswordExpires) > new Date());
+      // Clean up test user
+      await User.deleteOne({ email: testEmail });
+    }
+    console.log("✔ PASSED");
+
     console.log("\n=================================================");
-    console.log("  ALL 13 GOOGLE OAUTH 2.0 GMAIL TESTS PASSED!    ");
+    console.log("  ALL 20 GOOGLE OAUTH 2.0 GMAIL TESTS PASSED!    ");
     console.log("=================================================\n");
   } catch (err) {
     console.error("\n❌ GOOGLE OAUTH TEST SUITE FAILED:", err);

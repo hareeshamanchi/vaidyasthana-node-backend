@@ -611,6 +611,57 @@ const revokeGmailAuthorization = async () => {
   };
 };
 
+/**
+ * Synchronous check whether a Gmail OAuth refresh token is cached in memory or provided via env.
+ *
+ * @param {string} [senderAddress]
+ * @returns {boolean}
+ */
+const isGmailOAuthAuthorizedSync = (senderAddress) => {
+  const config = getGoogleOAuthConfig();
+  if (!config.configured) return false;
+  const targetSender = (senderAddress || config.senderAddress || "").toLowerCase().trim();
+
+  if (inMemoryRefreshTokenCache && inMemoryRefreshTokenCache.refreshToken) {
+    if (
+      !targetSender ||
+      inMemoryRefreshTokenCache.senderAddress.toLowerCase() === targetSender
+    ) {
+      return true;
+    }
+  }
+
+  if (process.env.GMAIL_REFRESH_TOKEN && process.env.GMAIL_REFRESH_TOKEN.trim().length > 10) {
+    return true;
+  }
+
+  return false;
+};
+
+/**
+ * Asynchronous check whether a Gmail OAuth refresh token is authorized (memory cache, env, or DB).
+ *
+ * @param {string} [senderAddress]
+ * @returns {Promise<boolean>}
+ */
+const isGmailOAuthAuthorized = async (senderAddress) => {
+  const config = getGoogleOAuthConfig();
+  if (!config.configured) return false;
+  const token = await getStoredRefreshToken(senderAddress || config.senderAddress);
+  return Boolean(token);
+};
+
+/**
+ * Test helper to manually set in-memory refresh token cache.
+ */
+const _setInMemoryRefreshToken = ({ senderAddress, refreshToken }) => {
+  inMemoryRefreshTokenCache = {
+    senderAddress: (senderAddress || "vaidyasthana.clinical@gmail.com").toLowerCase().trim(),
+    refreshToken,
+    authorizedAt: new Date(),
+  };
+};
+
 module.exports = {
   getGoogleOAuthConfig,
   createOAuth2Client,
@@ -621,9 +672,13 @@ module.exports = {
   getStoredRefreshToken,
   getGmailOAuthStatus,
   revokeGmailAuthorization,
+  isGmailOAuthAuthorizedSync,
+  isGmailOAuthAuthorized,
+  _setInMemoryRefreshToken,
   maskEmail,
   cleanEnv,
   encryptSecret,
   decryptSecret,
   _resetOAuthStates,
 };
+
