@@ -112,130 +112,48 @@ const normalizeStatus = (status) => {
   return String(status || "").trim().toUpperCase();
 };
 
-// Resolve clinic timezone with fallback to Asia/Kolkata
-const getClinicTimezone = (overrideTz) => {
-  const candidate = (
-    overrideTz ||
-    process.env.CLINIC_TIMEZONE ||
-    process.env.APP_TIMEZONE ||
-    "Asia/Kolkata"
-  ).trim();
-  try {
-    Intl.DateTimeFormat(undefined, { timeZone: candidate });
-    return candidate;
-  } catch (e) {
-    return "Asia/Kolkata";
-  }
-};
-
-// Retrieve current date & time parts calculated in the specified clinic timezone
-const getNowInTimezone = (timeZone) => {
-  const tz = getClinicTimezone(timeZone);
+// Check if a normalized UTC midnight date represents today in local date
+const isDateToday = (targetDateUTC) => {
+  if (!targetDateUTC) return false;
   const now = new Date();
-
-  const formatter = new Intl.DateTimeFormat("en-US", {
-    timeZone: tz,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-
-  const parts = formatter.formatToParts(now);
-  const map = {};
-  for (const { type, value } of parts) {
-    map[type] = value;
-  }
-
-  const year = parseInt(map.year, 10);
-  const month = parseInt(map.month, 10);
-  const day = parseInt(map.day, 10);
-  let hour = parseInt(map.hour, 10);
-  if (hour === 24) hour = 0;
-  const minute = parseInt(map.minute, 10);
-  const second = parseInt(map.second, 10);
-
-  const dateStr = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
-  const currentMinutes = hour * 60 + minute;
-
-  return {
-    year,
-    month,
-    day,
-    hour,
-    minute,
-    second,
-    dateStr,
-    currentMinutes,
-    timeZone: tz,
-  };
+  const todayUTC = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0));
+  return targetDateUTC.getTime() === todayUTC.getTime();
 };
 
-// Extract YYYY-MM-DD string representation of a date input in clinic timezone
-const extractDateOnlyStr = (dateInput, timeZone) => {
-  if (!dateInput) return null;
-  if (typeof dateInput === "string") {
-    const match = dateInput.match(/^(\d{4})-(\d{2})-(\d{2})/);
-    if (match) return `${match[1]}-${match[2]}-${match[3]}`;
-  }
-  const d = new Date(dateInput);
-  if (isNaN(d.getTime())) return null;
-  const tz = getClinicTimezone(timeZone);
-  try {
-    const formatter = new Intl.DateTimeFormat("en-US", {
-      timeZone: tz,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-    });
-    const parts = formatter.formatToParts(d);
-    const map = {};
-    for (const p of parts) map[p.type] = p.value;
-    return `${map.year}-${map.month}-${map.day}`;
-  } catch (e) {
-    const year = d.getUTCFullYear();
-    const month = String(d.getUTCMonth() + 1).padStart(2, "0");
-    const day = String(d.getUTCDate()).padStart(2, "0");
-    return `${year}-${month}-${day}`;
-  }
+// Check if a normalized UTC midnight date is before today
+const isDateInPast = (targetDateUTC) => {
+  if (!targetDateUTC) return false;
+  const now = new Date();
+  const todayUTC = new Date(Date.UTC(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0));
+  return targetDateUTC.getTime() < todayUTC.getTime();
 };
 
-// Check if target date represents today in clinic timezone
-const isDateToday = (targetDate, timeZone) => {
-  const targetStr = extractDateOnlyStr(targetDate, timeZone);
-  if (!targetStr) return false;
-  const nowTz = getNowInTimezone(timeZone);
-  return targetStr === nowTz.dateStr;
-};
-
-// Check if target date is before today in clinic timezone
-const isDateInPast = (targetDate, timeZone) => {
-  const targetStr = extractDateOnlyStr(targetDate, timeZone);
-  if (!targetStr) return false;
-  const nowTz = getNowInTimezone(timeZone);
-  return targetStr < nowTz.dateStr;
-};
-
-// Check if an appointment's scheduled date and time has passed in clinic timezone
-const isAppointmentInPast = (appointment, timeZone) => {
+// Check if an appointment's scheduled date and time has passed
+const isAppointmentInPast = (appointment) => {
   if (!appointment || !appointment.appointmentDate) return false;
-  const apptDateStr = extractDateOnlyStr(appointment.appointmentDate, timeZone);
-  if (!apptDateStr) return false;
+  const apptDate = new Date(appointment.appointmentDate);
+  if (isNaN(apptDate.getTime())) return false;
 
-  const nowTz = getNowInTimezone(timeZone);
+  const now = new Date();
+  const y = apptDate.getUTCFullYear();
+  const m = apptDate.getUTCMonth();
+  const d = apptDate.getUTCDate();
 
-  if (apptDateStr < nowTz.dateStr) {
+  const apptLocalMidnight = new Date(y, m, d, 0, 0, 0, 0).getTime();
+  const todayLocalMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0).getTime();
+
+  if (apptLocalMidnight < todayLocalMidnight) {
     return true;
   }
 
-  if (apptDateStr === nowTz.dateStr && appointment.timeSlot) {
+  if (apptLocalMidnight === todayLocalMidnight && appointment.timeSlot) {
     const slotStartStr = String(appointment.timeSlot).split("-")[0]?.trim();
     const slotMins = slotToMinutes(slotStartStr);
-    if (slotMins !== -1 && slotMins <= nowTz.currentMinutes) {
-      return true;
+    if (slotMins !== -1) {
+      const currentMins = now.getHours() * 60 + now.getMinutes();
+      if (slotMins < currentMins) {
+        return true;
+      }
     }
   }
 
@@ -292,7 +210,7 @@ const getDoctorsDirectory = async (req, res) => {
 // ==========================================
 const getAvailableSlots = async (req, res) => {
   try {
-    const { doctorId, date, timezone } = req.query;
+    const { doctorId, date } = req.query;
 
     if (!doctorId || !date) {
       return res.status(400).json({
@@ -336,42 +254,17 @@ const getAvailableSlots = async (req, res) => {
     }
 
     const targetDateUTC = parseDateUTC(date);
-    const targetDateStr = extractDateOnlyStr(date, timezone);
-    if (!targetDateUTC || !targetDateStr) {
+    if (!targetDateUTC) {
       return res.status(400).json({
         success: false,
         message: "Invalid date format. Please use YYYY-MM-DD.",
       });
     }
 
-    const nowTz = getNowInTimezone(timezone);
-    const isTargetDatePast = targetDateStr < nowTz.dateStr;
-    const isToday = targetDateStr === nowTz.dateStr;
-    const currentMinutes = nowTz.currentMinutes;
-
-    // Dynamically retrieve doctor's daily slots (default 08:00 AM to 08:00 PM, 30-min intervals, ending at 07:30 PM)
-    const consultationSlots = getDoctorConsultationSlots(doctor);
-
-    // If target date is strictly in the past, return all slots disabled
-    if (isTargetDatePast) {
-      const pastSlots = consultationSlots.map((slot) => ({
-        timeSlot: slot,
-        isAvailable: false,
-        isBooked: false,
-        isPast: true,
-        reason: "Appointment date has passed",
-      }));
-
-      return res.status(200).json({
-        success: true,
-        doctorId: doctor._id,
-        doctorName: doctor.name.startsWith("Dr.") ? doctor.name : `Dr. ${doctor.name}`,
-        department: doctor.specialization,
-        date: targetDateStr,
-        timezone: nowTz.timeZone,
-        totalSlots: pastSlots.length,
-        availableSlotsCount: 0,
-        slots: pastSlots,
+    if (isDateInPast(targetDateUTC)) {
+      return res.status(400).json({
+        success: false,
+        message: "Appointment date cannot be in the past. Please select today or a future date.",
       });
     }
 
@@ -399,6 +292,13 @@ const getAvailableSlots = async (req, res) => {
         .map((app) => parseTimeSlotToMinutes(app.timeSlot))
         .filter((mins) => mins !== -1)
     );
+
+    const isToday = isDateToday(targetDateUTC);
+    const now = new Date();
+    const currentMinutes = now.getHours() * 60 + now.getMinutes();
+
+    // Dynamically retrieve doctor's daily slots (default 08:00 AM to 08:00 PM, 30-min intervals, ending at 07:30 PM)
+    const consultationSlots = getDoctorConsultationSlots(doctor);
 
     // Compute slots with real availability, past slot detection, and double-booking checks
     const slots = consultationSlots.map((slot) => {
@@ -430,8 +330,7 @@ const getAvailableSlots = async (req, res) => {
       doctorId: doctor._id,
       doctorName: doctor.name.startsWith("Dr.") ? doctor.name : `Dr. ${doctor.name}`,
       department: doctor.specialization,
-      date: targetDateStr,
-      timezone: nowTz.timeZone,
+      date: date.substring(0, 10),
       totalSlots: slots.length,
       availableSlotsCount: slots.filter((s) => s.isAvailable).length,
       slots,
@@ -521,11 +420,7 @@ const createAppointment = async (req, res) => {
       });
     }
 
-    const apptTimezone = req.body?.timezone || req.query?.timezone;
-    const nowTz = getNowInTimezone(apptTimezone);
-    const targetDateStr = extractDateOnlyStr(appointmentDate, apptTimezone);
-
-    if (!targetDateStr || targetDateStr < nowTz.dateStr) {
+    if (isDateInPast(parsedDate)) {
       return res.status(400).json({
         success: false,
         message: "Appointment date cannot be in the past. Please select today or a future date.",
@@ -549,8 +444,10 @@ const createAppointment = async (req, res) => {
       });
     }
 
-    if (targetDateStr === nowTz.dateStr) {
-      if (candidateSlotMins <= nowTz.currentMinutes) {
+    if (isDateToday(parsedDate)) {
+      const now = new Date();
+      const currentMinutes = now.getHours() * 60 + now.getMinutes();
+      if (candidateSlotMins <= currentMinutes) {
         return res.status(400).json({
           success: false,
           message: `The selected time slot (${cleanTimeSlot}) has already passed for today. Please select an upcoming slot.`,
@@ -1445,10 +1342,4 @@ module.exports = {
   updateAppointment,
   deleteAppointment,
   getVideoAccess,
-  getClinicTimezone,
-  getNowInTimezone,
-  extractDateOnlyStr,
-  isAppointmentInPast,
-  isDateToday,
-  isDateInPast,
 };
