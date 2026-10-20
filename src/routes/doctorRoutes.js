@@ -12,6 +12,15 @@ const {
   getVerificationStatus,
 } = require("../controllers/doctorController");
 
+const {
+  getDoctorAvailability,
+  updateDoctorAvailability,
+  getDoctorLeaves,
+  createDoctorLeave,
+  cancelDoctorLeave,
+  getPublicDoctorAvailability,
+} = require("../controllers/doctorAvailabilityController");
+
 const { protect, authorizeRoles } = require("../middleware/authMiddleware");
 
 // Memory storage for secure credential processing
@@ -21,8 +30,21 @@ const uploadCredentials = multer({
   limits: { fileSize: 15 * 1024 * 1024 }, // 15MB limit
 });
 
+// Public doctor availability endpoint (for booking & profile viewing)
+router.get("/availability/:doctorId", getPublicDoctorAvailability);
+
 // All clinician routes strictly enforce doctor or admin authorization
 router.use(protect, authorizeRoles("doctor", "admin"));
+
+// Doctor Availability & Schedule Management
+router.get("/availability", getDoctorAvailability);
+router.put("/availability", updateDoctorAvailability);
+
+// Doctor Leave Management
+router.get("/leaves", getDoctorLeaves);
+router.post("/leaves", createDoctorLeave);
+router.put("/leaves/:id/cancel", cancelDoctorLeave);
+router.delete("/leaves/:id", cancelDoctorLeave);
 
 // Patient dossier and clinical tools
 router.get("/patient-reports/:patientId", getPatientReports);

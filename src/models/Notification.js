@@ -34,6 +34,14 @@ const notificationSchema = new mongoose.Schema(
         "system_alert",
         "medication_reminder",
         "medication_missed",
+        "follow_up_created",
+        "follow_up_reminder",
+        "follow_up_due",
+        "follow_up_missed",
+        "appointment_missed",
+        "appointment_reschedule_needed",
+        "doctor_leave_scheduled",
+        "doctor_leave_cancelled",
         "general",
       ],
       default: "general",
@@ -46,7 +54,7 @@ const notificationSchema = new mongoose.Schema(
     },
     relatedModel: {
       type: String,
-      enum: ["Appointment", "Report", "User", "Contact", "Medication", "DoseEvent", null],
+      enum: ["Appointment", "Report", "User", "Contact", "Medication", "DoseEvent", "FollowUp", "DoctorLeave", null],
       default: null,
     },
     link: {

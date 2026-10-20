@@ -12,6 +12,14 @@ const {
   startMedicationReminderWorker,
   stopMedicationReminderWorker,
 } = require("./src/services/medicationReminderService");
+const {
+  startMissedAppointmentWorker,
+  stopMissedAppointmentWorker,
+} = require("./src/services/missedAppointmentService");
+const {
+  startFollowUpReminderWorker,
+  stopFollowUpReminderWorker,
+} = require("./src/services/followUpReminderService");
 
 connectDB();
 
@@ -27,6 +35,12 @@ startAppointmentExpiryCron(60000);
 // Start automatic medication reminder and dose tracking worker
 startMedicationReminderWorker(30000);
 
+// Start automatic missed appointment tracking worker
+startMissedAppointmentWorker(60000);
+
+// Start automatic doctor-recommended follow-up reminder worker
+startFollowUpReminderWorker(60000);
+
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT} (0.0.0.0)`);
 });
@@ -39,6 +53,8 @@ const handleShutdown = async (signal) => {
     try {
       stopAppointmentExpiryCron();
       stopMedicationReminderWorker();
+      stopMissedAppointmentWorker();
+      stopFollowUpReminderWorker();
       const { disconnectDB } = require("./src/config/db");
       await disconnectDB();
     } catch (e) {

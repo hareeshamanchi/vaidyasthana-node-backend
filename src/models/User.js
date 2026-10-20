@@ -48,9 +48,15 @@ const userSchema = new mongoose.Schema(
       default: "",
       trim: true,
     },
+    hospitalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Hospital",
+      default: null,
+      index: true,
+    },
     role: {
       type: String,
-      enum: ["patient", "doctor", "admin", "superadmin"],
+      enum: ["patient", "doctor", "receptionist", "hospital_admin", "admin", "superadmin"],
       default: "patient",
       index: true,
     },
@@ -118,6 +124,15 @@ const userSchema = new mongoose.Schema(
       default: "",
       trim: true,
     },
+    profilePhoto: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    languagesSpoken: {
+      type: [String],
+      default: ["English"],
+    },
     experienceYears: {
       type: Number,
       default: 5,
@@ -130,6 +145,33 @@ const userSchema = new mongoose.Schema(
       start: { type: String, default: "08:00 AM" },
       end: { type: String, default: "08:00 PM" },
       slotDurationMinutes: { type: Number, default: 30 },
+      workingDays: {
+        type: [String],
+        enum: ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+        default: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"],
+      },
+      breaks: [
+        {
+          title: { type: String, default: "Lunch Break", trim: true },
+          startTime: { type: String, required: true },
+          endTime: { type: String, required: true },
+        },
+      ],
+      weeklySchedule: [
+        {
+          day: { type: String, required: true },
+          isWorkingDay: { type: Boolean, default: true },
+          startTime: { type: String, default: "08:00 AM" },
+          endTime: { type: String, default: "08:00 PM" },
+          breaks: [
+            {
+              title: { type: String, default: "Break" },
+              startTime: { type: String, required: true },
+              endTime: { type: String, required: true },
+            },
+          ],
+        },
+      ],
     },
     verificationStatus: {
       type: String,
@@ -168,6 +210,35 @@ const userSchema = new mongoose.Schema(
     resetPasswordExpires: {
       type: Date,
       default: null,
+    },
+
+    // Session Management & Token Revocation
+    tokenVersion: {
+      type: Number,
+      default: 0,
+      index: true,
+    },
+
+    // Two-Factor Authentication (2FA)
+    twoFactorEnabled: {
+      type: Boolean,
+      default: false,
+      index: true,
+    },
+    twoFactorSecret: {
+      type: String,
+      default: null,
+      select: false,
+    },
+    twoFactorRecoveryCodes: {
+      type: [
+        {
+          codeHash: { type: String, required: true },
+          used: { type: Boolean, default: false },
+        },
+      ],
+      default: [],
+      select: false,
     },
   },
   {

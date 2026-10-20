@@ -1,5 +1,6 @@
 const Appointment = require("../models/Appointment");
 const User = require("../models/User");
+const FamilyMember = require("../models/FamilyMember");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 const { notifyAppointmentEvent } = require("../config/socket");
@@ -15,6 +16,14 @@ const {
 } = require("../utils/appointmentSorting");
 const { getConsultationWindowState, isAppointmentExpired } = require("../utils/consultationWindow");
 const { expireStaleAppointments } = require("../services/appointmentExpiryService");
+const FollowUp = require("../models/FollowUp");
+const { evaluateMissedAppointments } = require("../services/missedAppointmentService");
+const DoctorLeave = require("../models/DoctorLeave");
+const {
+  calculateDoctorSlots,
+  validateBookingAvailability,
+  getDoctorDaySchedule,
+} = require("../services/doctorAvailabilityService");
 
 const isDbConnected = () => mongoose.connection.readyState === 1;
 
@@ -262,6 +271,8 @@ const getDoctorsDirectory = async (req, res) => {
       });
     }
 
+    const { date, timezone } = req.query;
+
     // Only return doctors whose medical credentials have been verified
     const doctors = await User.find({
       role: "doctor",
@@ -272,10 +283,54 @@ const getDoctorsDirectory = async (req, res) => {
       )
       .sort({ name: 1 });
 
+    if (!date) {
+      return res.status(200).json({
+        success: true,
+        count: doctors.length,
+        doctors,
+      });
+    }
+
+    const targetDateUTC = parseDateUTC(date);
+    const targetDateStr = extractDateOnlyStr(date, timezone);
+
+    let activeLeaves = [];
+    if (targetDateUTC) {
+      activeLeaves = await DoctorLeave.find({
+        status: "active",
+        startDate: { $lte: targetDateUTC },
+        endDate: { $gte: targetDateUTC },
+      });
+    }
+
+    const leaveByDoctor = new Map();
+    activeLeaves.forEach((leave) => {
+      leaveByDoctor.set(leave.doctorId.toString(), leave);
+    });
+
+    const enrichedDoctors = doctors.map((doc) => {
+      const docObj = doc.toObject();
+      const leave = leaveByDoctor.get(doc._id.toString());
+      const daySchedule = getDoctorDaySchedule(doc, targetDateStr, timezone);
+
+      docObj.isOnLeave = Boolean(leave);
+      docObj.isWorkingDay = daySchedule.isWorkingDay;
+      docObj.leaveNotice = leave
+        ? (leave.isFullDay
+            ? "Doctor is on approved leave on this date."
+            : `Doctor is on partial leave on this date (${leave.startTime} - ${leave.endTime}).`)
+        : !daySchedule.isWorkingDay
+        ? "Doctor does not consult on this day of the week."
+        : null;
+
+      return docObj;
+    });
+
     return res.status(200).json({
       success: true,
-      count: doctors.length,
-      doctors,
+      count: enrichedDoctors.length,
+      date: targetDateStr,
+      doctors: enrichedDoctors,
     });
   } catch (error) {
     console.error("Get Doctors Directory Error:", error);
@@ -335,107 +390,14 @@ const getAvailableSlots = async (req, res) => {
       });
     }
 
-    const targetDateUTC = parseDateUTC(date);
-    const targetDateStr = extractDateOnlyStr(date, timezone);
-    if (!targetDateUTC || !targetDateStr) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid date format. Please use YYYY-MM-DD.",
-      });
+    // Delegate slot computation to doctorAvailabilityService
+    const slotsResult = await calculateDoctorSlots(doctor, date, timezone);
+
+    if (!slotsResult.success) {
+      return res.status(400).json(slotsResult);
     }
 
-    const nowTz = getNowInTimezone(timezone);
-    const isTargetDatePast = targetDateStr < nowTz.dateStr;
-    const isToday = targetDateStr === nowTz.dateStr;
-    const currentMinutes = nowTz.currentMinutes;
-
-    // Dynamically retrieve doctor's daily slots (default 08:00 AM to 08:00 PM, 30-min intervals, ending at 07:30 PM)
-    const consultationSlots = getDoctorConsultationSlots(doctor);
-
-    // If target date is strictly in the past, return all slots disabled
-    if (isTargetDatePast) {
-      const pastSlots = consultationSlots.map((slot) => ({
-        timeSlot: slot,
-        isAvailable: false,
-        isBooked: false,
-        isPast: true,
-        reason: "Appointment date has passed",
-      }));
-
-      return res.status(200).json({
-        success: true,
-        doctorId: doctor._id,
-        doctorName: doctor.name.startsWith("Dr.") ? doctor.name : `Dr. ${doctor.name}`,
-        department: doctor.specialization,
-        date: targetDateStr,
-        timezone: nowTz.timeZone,
-        totalSlots: pastSlots.length,
-        availableSlotsCount: 0,
-        slots: pastSlots,
-      });
-    }
-
-    // Date range for target day in UTC midnight
-    const startOfDay = new Date(targetDateUTC.getTime());
-    const endOfDay = new Date(targetDateUTC.getTime() + 24 * 60 * 60 * 1000 - 1);
-
-    // Retrieve appointments for this doctor on this day
-    const dayAppointments = await Appointment.find({
-      doctorId: doctor._id,
-      appointmentDate: { $gte: startOfDay, $lte: endOfDay },
-    }).select("timeSlot status");
-
-    // Filter out Cancelled and Rejected appointments so cancelled slots are immediately available again
-    const activeAppointments = dayAppointments.filter((app) => {
-      const s = normalizeStatus(app.status);
-      return s !== "CANCELLED" && s !== "REJECTED";
-    });
-
-    const bookedSlotStrings = new Set(
-      activeAppointments.map((app) => String(app.timeSlot || "").trim().toLowerCase())
-    );
-    const bookedSlotMinutes = new Set(
-      activeAppointments
-        .map((app) => parseTimeSlotToMinutes(app.timeSlot))
-        .filter((mins) => mins !== -1)
-    );
-
-    // Compute slots with real availability, past slot detection, and double-booking checks
-    const slots = consultationSlots.map((slot) => {
-      const slotMins = parseTimeSlotToMinutes(slot);
-      const isPast = isToday && slotMins !== -1 && slotMins <= currentMinutes;
-      const isBooked =
-        bookedSlotStrings.has(slot.trim().toLowerCase()) ||
-        (slotMins !== -1 && bookedSlotMinutes.has(slotMins));
-      const isAvailable = !isBooked && !isPast;
-
-      let reason = "Available";
-      if (isPast) {
-        reason = "Time slot has passed";
-      } else if (isBooked) {
-        reason = "Booked by another patient";
-      }
-
-      return {
-        timeSlot: slot,
-        isAvailable,
-        isBooked,
-        isPast,
-        reason,
-      };
-    });
-
-    return res.status(200).json({
-      success: true,
-      doctorId: doctor._id,
-      doctorName: doctor.name.startsWith("Dr.") ? doctor.name : `Dr. ${doctor.name}`,
-      department: doctor.specialization,
-      date: targetDateStr,
-      timezone: nowTz.timeZone,
-      totalSlots: slots.length,
-      availableSlotsCount: slots.filter((s) => s.isAvailable).length,
-      slots,
-    });
+    return res.status(200).json(slotsResult);
   } catch (error) {
     console.error("Get Available Slots Error:", error);
     return res.status(500).json({
@@ -497,6 +459,8 @@ const createAppointment = async (req, res) => {
       type,
       reason,
       notes,
+      followUpId,
+      familyMemberId,
     } = req.body;
 
     const cleanTimeSlot =
@@ -584,6 +548,22 @@ const createAppointment = async (req, res) => {
       });
     }
 
+    // Strict availability validation (Working days, daily hours, breaks, leaves, elapsed slots, active bookings)
+    const availabilityCheck = await validateBookingAvailability({
+      doctorId: targetDoctor._id,
+      date: parsedDate,
+      timeSlot: cleanTimeSlot,
+      timezone: apptTimezone,
+    });
+
+    if (!availabilityCheck.isValid) {
+      return res.status(availabilityCheck.conflict ? 409 : 400).json({
+        success: false,
+        message: availabilityCheck.message,
+        reason: availabilityCheck.reason,
+      });
+    }
+
     // Prevent double booking on backend (Race condition check)
     const startOfDay = new Date(parsedDate.getTime());
     const endOfDay = new Date(parsedDate.getTime() + 24 * 60 * 60 * 1000 - 1);
@@ -627,25 +607,82 @@ const createAppointment = async (req, res) => {
       });
     }
 
-    const finalReason = (reason || notes || "").trim();
-    const finalNotes = (notes || reason || "").trim();
+    let verifiedFollowUp = null;
+    if (followUpId) {
+      if (!mongoose.Types.ObjectId.isValid(followUpId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid follow-up ID format.",
+        });
+      }
+      verifiedFollowUp = await FollowUp.findById(followUpId);
+      if (!verifiedFollowUp) {
+        return res.status(404).json({
+          success: false,
+          message: "Referenced follow-up plan not found.",
+        });
+      }
+      if (verifiedFollowUp.patientId.toString() !== patientUser._id.toString()) {
+        return res.status(403).json({
+          success: false,
+          message: "You are not authorized to schedule an appointment for this follow-up plan.",
+        });
+      }
+      if (verifiedFollowUp.doctorId.toString() !== targetDoctor._id.toString()) {
+        return res.status(400).json({
+          success: false,
+          message: "The selected doctor does not match the physician assigned to this follow-up plan.",
+        });
+      }
+      if (verifiedFollowUp.status === "cancelled" || verifiedFollowUp.status === "completed") {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot schedule an appointment for a follow-up that is already ${verifiedFollowUp.status}.`,
+        });
+      }
+    }
+
+    let verifiedFamilyMember = null;
+    if (familyMemberId) {
+      if (mongoose.Types.ObjectId.isValid(familyMemberId)) {
+        verifiedFamilyMember = await FamilyMember.findOne({
+          _id: familyMemberId,
+          primaryAccountId: patientUser._id,
+        });
+      }
+    }
+
+    const finalReason = (reason || notes || verifiedFollowUp?.reason || "").trim();
+    const finalNotes = (notes || reason || verifiedFollowUp?.doctorInstructions || "").trim();
 
     const appointment = await Appointment.create({
       patientId: patientUser._id,
+      familyMemberId: verifiedFamilyMember ? verifiedFamilyMember._id : null,
+      familyMemberName: verifiedFamilyMember ? verifiedFamilyMember.fullName : null,
       doctorId: targetDoctor._id,
       doctorName: formattedDoctorName,
-      patientName: patientUser.name,
+      patientName: verifiedFamilyMember
+        ? `${verifiedFamilyMember.fullName} (Family - ${patientUser.name})`
+        : patientUser.name,
       patientPhone: patientUser.phoneNumber,
       patientEmail: patientUser.email,
       department: targetDoctor.specialization || department || "General Medicine",
       appointmentDate: parsedDate,
       timeSlot: cleanTimeSlot,
       consultationType: consultationType || "In-Person",
-      type: type || "Consultation",
+      type: type || (verifiedFollowUp ? "Follow-up" : "Consultation"),
       reason: finalReason,
       notes: finalNotes,
       status: "Scheduled",
+      followUpId: verifiedFollowUp ? verifiedFollowUp._id : null,
     });
+
+    // If booking a follow-up, update follow-up status and link appointment
+    if (verifiedFollowUp) {
+      verifiedFollowUp.appointmentId = appointment._id;
+      verifiedFollowUp.status = "appointment_booked";
+      await verifiedFollowUp.save();
+    }
 
     // Real-time synchronization: notify doctor and patient
     notifyAppointmentEvent({
@@ -752,8 +789,9 @@ const getAppointments = async (req, res) => {
           ? { patientId: userIdObj }
           : {}
       );
+      await evaluateMissedAppointments();
     } catch (expErr) {
-      console.warn("Lazy expiry warning in getAppointments:", expErr.message);
+      console.warn("Lazy evaluation warning in getAppointments:", expErr.message);
     }
 
     const appointments = await Appointment.find(query)
@@ -935,7 +973,7 @@ const updateAppointment = async (req, res) => {
     // Doctor actions: Confirm, Complete, Reject, Cancel, Expire
     if (isDoctorOwner || isAdmin) {
       if (status) {
-        if (!["Scheduled", "Confirmed", "In Progress", "Completed", "Cancelled", "Rejected", "Expired"].includes(status)) {
+        if (!["Scheduled", "Confirmed", "In Progress", "Completed", "Cancelled", "Rejected", "Expired", "Missed"].includes(status)) {
           return res.status(400).json({
             success: false,
             message: "Invalid appointment status value.",
@@ -1030,7 +1068,7 @@ const updateAppointment = async (req, res) => {
             message: `Cannot reschedule an appointment that is already ${appointment.status.toLowerCase()}.`,
           });
         }
-        if (isAppointmentInPast(appointment)) {
+        if (currentStatusNorm !== "RESCHEDULING NEEDED" && isAppointmentInPast(appointment)) {
           return res.status(400).json({
             success: false,
             message: "Cannot reschedule past appointments.",
@@ -1046,34 +1084,65 @@ const updateAppointment = async (req, res) => {
         }
         const newSlot = timeSlot ? timeSlot.trim() : appointment.timeSlot;
 
-        // Check for double booking conflicts on the new slot
-        const startOfDay = new Date(newDate.getTime());
-        const endOfDay = new Date(newDate.getTime() + 24 * 60 * 60 * 1000 - 1);
-
-        const conflict = await Appointment.findOne({
-          _id: { $ne: appointment._id },
+        // Validate complete doctor availability (Working days, hours, breaks, leaves, elapsed slots, collisions)
+        const availabilityCheck = await validateBookingAvailability({
           doctorId: appointment.doctorId,
-          appointmentDate: { $gte: startOfDay, $lte: endOfDay },
+          date: newDate,
           timeSlot: newSlot,
-          status: { $nin: ["Cancelled", "Rejected"] },
+          excludeAppointmentId: appointment._id,
+          timezone: req.body?.timezone || req.query?.timezone,
         });
 
-        if (conflict) {
-          return res.status(409).json({
+        if (!availabilityCheck.isValid) {
+          return res.status(availabilityCheck.conflict ? 409 : 400).json({
             success: false,
-            message: `The selected slot '${newSlot}' is already occupied. Please choose another slot.`,
+            message: availabilityCheck.message,
+            reason: availabilityCheck.reason,
           });
         }
 
         appointment.appointmentDate = newDate;
         appointment.timeSlot = newSlot;
         appointment.status = "Scheduled"; // Re-mark as scheduled on reschedule
+        appointment.rescheduleReason = undefined;
+        appointment.leaveId = undefined;
       }
     }
 
-    if (notes !== undefined) appointment.notes = notes;
-
     await appointment.save();
+
+    // Synchronize linked follow-up plan status
+    try {
+      if (requestedStatusNorm === "COMPLETED") {
+        if (appointment.followUpId) {
+          await FollowUp.findByIdAndUpdate(appointment.followUpId, { status: "completed" });
+        } else {
+          await FollowUp.updateMany({ appointmentId: appointment._id }, { status: "completed" });
+        }
+      } else if (requestedStatusNorm === "CANCELLED") {
+        if (appointment.followUpId) {
+          const fu = await FollowUp.findById(appointment.followUpId);
+          if (fu && fu.status !== "cancelled") {
+            fu.status = "pending_booking";
+            fu.appointmentId = null;
+            await fu.save();
+          }
+        } else {
+          await FollowUp.updateMany(
+            { appointmentId: appointment._id, status: { $ne: "cancelled" } },
+            { status: "pending_booking", appointmentId: null }
+          );
+        }
+      } else if (requestedStatusNorm === "MISSED") {
+        if (appointment.followUpId) {
+          await FollowUp.findByIdAndUpdate(appointment.followUpId, { status: "missed" });
+        } else {
+          await FollowUp.updateMany({ appointmentId: appointment._id }, { status: "missed" });
+        }
+      }
+    } catch (syncErr) {
+      console.warn("FollowUp status sync warning:", syncErr.message);
+    }
 
     // Notify real-time subscribers
     notifyAppointmentEvent({
@@ -1224,6 +1293,25 @@ const deleteAppointment = async (req, res) => {
     appointment.status = "Cancelled";
     appointment.cancellationReason = req.body?.reason || "Cancelled by user";
     await appointment.save();
+
+    // Revert any linked follow-up plan to pending_booking so patient can re-schedule
+    try {
+      if (appointment.followUpId) {
+        const fu = await FollowUp.findById(appointment.followUpId);
+        if (fu && fu.status !== "cancelled") {
+          fu.status = "pending_booking";
+          fu.appointmentId = null;
+          await fu.save();
+        }
+      } else {
+        await FollowUp.updateMany(
+          { appointmentId: appointment._id, status: { $ne: "cancelled" } },
+          { status: "pending_booking", appointmentId: null }
+        );
+      }
+    } catch (e) {
+      console.warn("FollowUp revert on delete warning:", e.message);
+    }
 
     notifyAppointmentEvent({
       doctorId: appointment.doctorId,

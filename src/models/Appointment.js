@@ -8,6 +8,23 @@ const appointmentSchema = new mongoose.Schema(
       required: [true, "Patient reference is required"],
       index: true,
     },
+    familyMemberId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "FamilyMember",
+      default: null,
+      index: true,
+    },
+    familyMemberName: {
+      type: String,
+      default: null,
+      trim: true,
+    },
+    hospitalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Hospital",
+      default: null,
+      index: true,
+    },
     doctorId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -62,8 +79,25 @@ const appointmentSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["Scheduled", "Confirmed", "In Progress", "Completed", "Cancelled", "Rejected", "Expired"],
+      enum: ["Scheduled", "Confirmed", "In Progress", "Completed", "Cancelled", "Rejected", "Expired", "Missed", "Rescheduling Needed"],
       default: "Scheduled",
+      index: true,
+    },
+    rescheduleReason: {
+      type: String,
+      default: "",
+      trim: true,
+    },
+    leaveId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "DoctorLeave",
+      default: null,
+      index: true,
+    },
+    followUpId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "FollowUp",
+      default: null,
       index: true,
     },
     type: {

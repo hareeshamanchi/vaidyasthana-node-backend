@@ -9,6 +9,20 @@ const reportSchema = new mongoose.Schema(
       index: true,
     },
 
+    familyMemberId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "FamilyMember",
+      default: null,
+      index: true,
+    },
+
+    hospitalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Hospital",
+      default: null,
+      index: true,
+    },
+
     uploadedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
@@ -18,7 +32,7 @@ const reportSchema = new mongoose.Schema(
 
     uploadedByRole: {
       type: String,
-      enum: ["patient", "doctor", "admin"],
+      enum: ["patient", "doctor", "admin", "hospital_admin", "receptionist", "superadmin"],
       default: "patient",
     },
 

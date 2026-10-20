@@ -35,19 +35,43 @@ const protect = async (req, res, next) => {
       name: decoded.name || "",
       email: decoded.email || "",
       status: "active",
+      tokenVersion: decoded.tokenVersion || 0,
+      hospitalId: decoded.hospitalId || null,
     };
 
-    // Verify current identity, role, and active status directly in database
-    if (mongoose.connection.readyState === 1 && decoded.id) {
+    // Verify current identity, role, active status, and session tokenVersion directly in database
+    if ((mongoose.connection.readyState === 1 || process.env.NODE_ENV === "test") && decoded.id) {
       try {
         const user = await User.findById(decoded.id).select(
-          "_id name email role status suspensionHistory"
+          "_id name email role status suspensionHistory tokenVersion hospitalId"
         );
 
         if (!user) {
           return res.status(401).json({
             success: false,
             message: "User account associated with this session no longer exists.",
+          });
+        }
+
+        // Enforce session revocation check (Logout-all-devices, password change, etc.)
+        if (
+          decoded.tokenVersion !== undefined &&
+          user.tokenVersion !== undefined &&
+          user.tokenVersion !== decoded.tokenVersion
+        ) {
+          recordAuditEvent({
+            eventType: "AUTH_SESSION_REVOKED",
+            actor: user,
+            action: "Access attempted with revoked token version",
+            outcome: "failure",
+            reason: `Token version (${decoded.tokenVersion}) does not match current user version (${user.tokenVersion})`,
+            req,
+          });
+
+          return res.status(401).json({
+            success: false,
+            code: "SESSION_REVOKED",
+            message: "Your session has been invalidated or logged out. Please log in again.",
           });
         }
 
@@ -77,6 +101,8 @@ const protect = async (req, res, next) => {
           email: user.email,
           role: user.role,
           status: user.status || "active",
+          tokenVersion: user.tokenVersion || 0,
+          hospitalId: user.hospitalId || null,
         };
       } catch (dbErr) {
         // Continue with decoded token payload if DB lookup encounters transient issue
@@ -94,27 +120,52 @@ const protect = async (req, res, next) => {
 
 const authorizeRoles = (...roles) => {
   return (req, res, next) => {
-    if (!req.user || !roles.includes(req.user.role)) {
-      const attemptedRole = req.user?.role || "unknown";
+    if (!req.user) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
 
-      if (roles.includes("admin") || roles.includes("superadmin")) {
+    const userRole = req.user.role || "unknown";
+
+    // Normalize role checks with backward-compatibility for admin <-> hospital_admin and superadmin inheritance
+    const hasRole = roles.some((role) => {
+      if (role === userRole) return true;
+      if (role === "admin" && (userRole === "hospital_admin" || userRole === "superadmin")) return true;
+      if (role === "hospital_admin" && (userRole === "admin" || userRole === "superadmin")) return true;
+      return false;
+    });
+
+    if (!hasRole) {
+      if (roles.includes("admin") || roles.includes("superadmin") || roles.includes("hospital_admin")) {
         recordAuditEvent({
           eventType: "UNAUTHORIZED_ADMIN_ATTEMPT",
           actor: req.user,
           action: "Unauthorized administrative access attempt",
           outcome: "failure",
-          reason: `Role '${attemptedRole}' is not authorized. Required: [${roles.join(", ")}]`,
+          reason: `Role '${userRole}' is not authorized. Required: [${roles.join(", ")}]`,
           req,
         });
       }
 
       return res.status(403).json({
         success: false,
-        message: `Forbidden: role '${attemptedRole}' is not authorized to access this resource.`,
+        message: `Forbidden: role '${userRole}' is not authorized to access this resource.`,
       });
     }
     next();
   };
+};
+
+/**
+ * Multi-Hospital Scope Middleware: attaches hospital scope to request if user is scoped
+ */
+const enforceHospitalScope = (req, res, next) => {
+  if (req.user && req.user.hospitalId) {
+    req.hospitalScope = req.user.hospitalId;
+  }
+  next();
 };
 
 /**
@@ -166,4 +217,5 @@ module.exports = {
   authorizeRoles,
   requireSuperAdmin,
   requireStrictSuperAdmin,
+  enforceHospitalScope,
 };

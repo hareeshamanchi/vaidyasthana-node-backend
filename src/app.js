@@ -15,6 +15,7 @@ const notificationRoutes = require("./routes/notificationRoutes");
 const timelineRoutes = require("./routes/timelineRoutes");
 const medicationRoutes = require("./routes/medicationRoutes");
 const pushRoutes = require("./routes/pushRoutes");
+const followUpRoutes = require("./routes/followUpRoutes");
 const googleOAuthRoutes = require("./routes/googleOAuthRoutes");
 const errorHandler = require("./middleware/errorHandler");
 
@@ -95,6 +96,7 @@ app.use("/api/notifications", notificationRoutes);
 app.use("/api/timeline", timelineRoutes);
 app.use("/api/medications", medicationRoutes);
 app.use("/api/push", pushRoutes);
+app.use("/api/follow-ups", followUpRoutes);
 
 /*
 |--------------------------------------------------------------------------
@@ -120,6 +122,7 @@ app.get("/", (req, res) => {
       notifications: "/api/notifications",
       timeline: "/api/timeline",
       medications: "/api/medications",
+      followUps: "/api/follow-ups",
     },
   });
 });
