@@ -168,48 +168,110 @@ const enforceHospitalScope = (req, res, next) => {
   next();
 };
 
+const { hasPermission } = require("../config/permissions");
+
 /**
- * Super Admin Middleware: allows 'superadmin' and 'admin' roles by default
+ * Super Admin / Platform Owner Middleware:
+ * Strictly reserved for the Vaidyasthana SaaS platform operator.
+ * Hospital Admins and legacy administrators are blocked from platform ownership.
  */
-const requireSuperAdmin = (req, res, next) => {
-  if (!req.user || (req.user.role !== "superadmin" && req.user.role !== "admin")) {
+const requirePlatformOwner = (req, res, next) => {
+  if (!req.user || req.user.role !== "superadmin") {
     recordAuditEvent({
       eventType: "UNAUTHORIZED_ADMIN_ATTEMPT",
       actor: req.user,
-      action: "Superadmin route access attempt",
+      action: "Platform Owner route access attempt",
       outcome: "failure",
-      reason: `Role '${req.user?.role || "unknown"}' lacks administrative privilege.`,
+      reason: `Role '${req.user?.role || "unknown"}' lacks platform owner privilege.`,
       req,
     });
 
     return res.status(403).json({
       success: false,
-      message: "Forbidden: Super Administrator access required.",
+      message: "Forbidden: Dedicated Platform Owner (Super Administrator) access required.",
     });
   }
   next();
 };
 
+const requireSuperAdmin = requirePlatformOwner;
+const requireStrictSuperAdmin = requirePlatformOwner;
+
 /**
- * Strict Super Admin Middleware: allows ONLY the highest-privilege 'superadmin' role
+ * Hospital Admin Middleware:
+ * Allows authorized administrators of a hospital.
+ * Enforces that a non-superadmin hospital_admin must be bound to a valid hospitalId.
  */
-const requireStrictSuperAdmin = (req, res, next) => {
-  if (!req.user || req.user.role !== "superadmin") {
+const requireHospitalAdmin = (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({
+      success: false,
+      message: "Authentication required.",
+    });
+  }
+
+  const role = req.user.role;
+  const isSuper = role === "superadmin";
+  const isHospAdmin = role === "hospital_admin" || (role === "admin" && req.user.hospitalId);
+
+  if (!isSuper && !isHospAdmin) {
     recordAuditEvent({
-      eventType: "UNAUTHORIZED_ADMIN_ATTEMPT",
+      eventType: "UNAUTHORIZED_HOSPITAL_ADMIN_ATTEMPT",
       actor: req.user,
-      action: "Strict superadmin action attempt",
+      action: "Hospital administrator route access attempt",
       outcome: "failure",
-      reason: `Role '${req.user?.role || "unknown"}' is not superadmin.`,
+      reason: `Role '${role}' is not a hospital administrator.`,
       req,
     });
 
     return res.status(403).json({
       success: false,
-      message: "Forbidden: Dedicated Super Administrator role required for this sensitive action.",
+      message: "Forbidden: Hospital Administrator privilege required.",
     });
   }
+
+  // If not superadmin, hospital admin MUST belong to a hospital
+  if (!isSuper && !req.user.hospitalId) {
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden: Hospital administrator is not assigned to any hospital tenant.",
+    });
+  }
+
   next();
+};
+
+/**
+ * Permission-Based Middleware:
+ * Checks whether user's role grants specific permission in the central matrix.
+ */
+const requirePermission = (permission) => {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication required.",
+      });
+    }
+
+    if (!hasPermission(req.user.role, permission)) {
+      recordAuditEvent({
+        eventType: "UNAUTHORIZED_PERMISSION_ATTEMPT",
+        actor: req.user,
+        action: `Attempted action requiring '${permission}'`,
+        outcome: "failure",
+        reason: `Role '${req.user.role}' lacks permission '${permission}'`,
+        req,
+      });
+
+      return res.status(403).json({
+        success: false,
+        message: `Forbidden: your role (${req.user.role}) does not have permission for '${permission}'.`,
+      });
+    }
+
+    next();
+  };
 };
 
 module.exports = {
@@ -217,5 +279,8 @@ module.exports = {
   authorizeRoles,
   requireSuperAdmin,
   requireStrictSuperAdmin,
+  requirePlatformOwner,
+  requireHospitalAdmin,
+  requirePermission,
   enforceHospitalScope,
 };

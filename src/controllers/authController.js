@@ -1,4 +1,5 @@
 const User = require("../models/User");
+const HospitalInvitation = require("../models/HospitalInvitation");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const mongoose = require("mongoose");
@@ -1821,6 +1822,161 @@ const updateDoctorProfile = async (req, res) => {
   }
 };
 
+// ==========================================
+// Validate Hospital Invitation Token
+// GET /api/auth/invitation/:token
+// ==========================================
+const validateInvitationToken = async (req, res) => {
+  try {
+    const { token } = req.params;
+    if (!token) {
+      return res.status(400).json({
+        success: false,
+        message: "Invitation token is required.",
+      });
+    }
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const invitation = await HospitalInvitation.findOne({
+      tokenHash,
+      status: "pending",
+      expiresAt: { $gt: new Date() },
+    }).populate("hospitalId", "name hospitalCode timezone branding");
+
+    if (!invitation) {
+      return res.status(400).json({
+        success: false,
+        message: "This invitation link is invalid, expired, or has already been used.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      invitation: {
+        id: invitation._id,
+        email: invitation.email,
+        name: invitation.name,
+        role: invitation.role,
+        hospital: invitation.hospitalId,
+        expiresAt: invitation.expiresAt,
+      },
+    });
+  } catch (error) {
+    console.error("Validate Invitation Token Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error validating invitation token.",
+    });
+  }
+};
+
+// ==========================================
+// Accept Hospital Invitation & Activate Staff Account
+// POST /api/auth/accept-invitation
+// ==========================================
+const acceptInvitation = async (req, res) => {
+  try {
+    const { token, name, password, phoneNumber } = req.body;
+    if (!token || !password) {
+      return res.status(400).json({
+        success: false,
+        message: "Token and password are required.",
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: "Password must be at least 6 characters.",
+      });
+    }
+
+    const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+    const invitation = await HospitalInvitation.findOne({
+      tokenHash,
+      status: "pending",
+      expiresAt: { $gt: new Date() },
+    });
+
+    if (!invitation) {
+      return res.status(400).json({
+        success: false,
+        message: "This invitation link is invalid, expired, or has already been used.",
+      });
+    }
+
+    // Check if user already exists
+    let user = await User.findOne({ email: invitation.email.toLowerCase() });
+
+    const salt = await bcrypt.genSalt(10);
+    const hashedPassword = await bcrypt.hash(password, salt);
+
+    if (user) {
+      user.password = hashedPassword;
+      user.role = invitation.role;
+      user.hospitalId = invitation.hospitalId;
+      user.status = "active";
+      if (name) user.name = name.trim();
+      if (phoneNumber) user.phoneNumber = phoneNumber;
+      await user.save();
+    } else {
+      user = await User.create({
+        name: name ? name.trim() : invitation.name || "Hospital Staff",
+        email: invitation.email.toLowerCase(),
+        password: hashedPassword,
+        phoneNumber: phoneNumber || "",
+        role: invitation.role,
+        hospitalId: invitation.hospitalId,
+        status: "active",
+      });
+    }
+
+    // Mark invitation accepted
+    invitation.status = "accepted";
+    invitation.acceptedAt = new Date();
+    await invitation.save();
+
+    const authToken = generateToken(user);
+
+    res.cookie("token", authToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      sameSite: "lax",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+
+    recordAuditEvent({
+      eventType: "INVITATION_ACCEPTED",
+      actor: user,
+      action: `User accepted invitation for role '${invitation.role}' at hospital ${invitation.hospitalId}`,
+      outcome: "success",
+      targetId: user._id,
+      req,
+    });
+
+    return res.status(200).json({
+      success: true,
+      message: "Account activated successfully. Welcome to Vaidyasthana!",
+      token: authToken,
+      user: {
+        id: user._id,
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        hospitalId: user.hospitalId,
+        status: user.status,
+      },
+    });
+  } catch (error) {
+    console.error("Accept Invitation Error:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Server error accepting invitation.",
+    });
+  }
+};
+
 module.exports = {
   registerUser,
   loginUser,
@@ -1838,6 +1994,8 @@ module.exports = {
   disableTwoFactorAuth,
   verifyTwoFactorLogin,
   updateDoctorProfile,
+  validateInvitationToken,
+  acceptInvitation,
   _resetRateLimits,
   getFrontendBaseUrl,
   DEPLOYED_FRONTEND_URL,

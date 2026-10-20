@@ -46,6 +46,12 @@ const followUpSchema = new mongoose.Schema(
       default: null,
       index: true,
     },
+    hospitalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Hospital",
+      default: null,
+      index: true,
+    },
     reason: {
       type: String,
       required: [true, "Follow-up reason is required"],

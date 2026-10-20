@@ -656,6 +656,7 @@ const createAppointment = async (req, res) => {
     const finalNotes = (notes || reason || verifiedFollowUp?.doctorInstructions || "").trim();
 
     const appointment = await Appointment.create({
+      hospitalId: targetDoctor.hospitalId || patientUser.hospitalId || req.user.hospitalId || null,
       patientId: patientUser._id,
       familyMemberId: verifiedFamilyMember ? verifiedFamilyMember._id : null,
       familyMemberName: verifiedFamilyMember ? verifiedFamilyMember.fullName : null,
@@ -687,6 +688,7 @@ const createAppointment = async (req, res) => {
     // Real-time synchronization: notify doctor and patient
     notifyAppointmentEvent({
       doctorId: targetDoctor._id,
+      hospitalId: targetDoctor.hospitalId || patientUser.hospitalId || req.user.hospitalId || null,
       patientId: patientUser._id,
       appointment,
       action: "created",
@@ -761,8 +763,31 @@ const getAppointments = async (req, res) => {
     } else if (req.user.role === "patient") {
       // Patient view: strictly return appointments booked by THIS patient
       query = { patientId: userIdObj };
+    } else if (["hospital_admin", "receptionist", "nurse", "billing_staff"].includes(req.user.role)) {
+      // Hospital staff view: strictly scoped to staff's hospital
+      if (!req.user.hospitalId) {
+        return res.status(403).json({
+          success: false,
+          message: "Forbidden: User is not associated with an active hospital tenant.",
+        });
+      }
+      query = { hospitalId: req.user.hospitalId };
+      if (req.query.doctorId && mongoose.Types.ObjectId.isValid(req.query.doctorId)) {
+        query.doctorId = new mongoose.Types.ObjectId(req.query.doctorId);
+      }
+    } else if (req.user.role === "superadmin") {
+      // Platform Owner view: platform-wide or filtered by hospital
+      if (req.query.hospitalId && mongoose.Types.ObjectId.isValid(req.query.hospitalId)) {
+        query.hospitalId = new mongoose.Types.ObjectId(req.query.hospitalId);
+      }
+      if (req.query.doctorId && mongoose.Types.ObjectId.isValid(req.query.doctorId)) {
+        query.doctorId = new mongoose.Types.ObjectId(req.query.doctorId);
+      }
     } else if (req.user.role === "admin") {
-      // Admin view: optionally filter
+      // Legacy admin view: scoped to hospitalId if present
+      if (req.user.hospitalId) {
+        query.hospitalId = req.user.hospitalId;
+      }
       if (req.query.doctorId) {
         query.doctorId = mongoose.Types.ObjectId.isValid(req.query.doctorId)
           ? new mongoose.Types.ObjectId(req.query.doctorId)
@@ -881,14 +906,21 @@ const getAppointmentById = async (req, res) => {
       await appointment.save();
     }
 
-    // Access control: only the patient, assigned doctor, or admin
+    // Access control: patient owner, assigned doctor, hospital staff for their hospital, or superadmin
     const patientRefStr = appointment.patientId?._id?.toString() || appointment.patientId?.toString();
     const doctorRefStr = appointment.doctorId?._id?.toString() || appointment.doctorId?.toString();
     const isPatientOwner = patientRefStr === req.user.id;
     const isDoctorOwner = doctorRefStr === req.user.id;
-    const isAdmin = req.user.role === "admin";
+    const isSuperAdmin = req.user.role === "superadmin";
+    const isHospitalStaff = Boolean(
+      req.user.hospitalId &&
+      appointment.hospitalId &&
+      req.user.hospitalId.toString() === appointment.hospitalId.toString() &&
+      ["hospital_admin", "admin", "receptionist", "nurse", "billing_staff"].includes(req.user.role)
+    );
+    const isLegacyAdminWithoutHospital = req.user.role === "admin" && !req.user.hospitalId && !appointment.hospitalId;
 
-    if (!isPatientOwner && !isDoctorOwner && !isAdmin) {
+    if (!isPatientOwner && !isDoctorOwner && !isSuperAdmin && !isHospitalStaff && !isLegacyAdminWithoutHospital) {
       return res.status(403).json({
         success: false,
         message: "Access denied. You are not authorized to view this appointment.",

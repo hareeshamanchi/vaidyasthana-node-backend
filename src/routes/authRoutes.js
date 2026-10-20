@@ -18,6 +18,8 @@ const {
   disableTwoFactorAuth,
   verifyTwoFactorLogin,
   updateDoctorProfile,
+  validateInvitationToken,
+  acceptInvitation,
 } = require("../controllers/authController");
 
 const {
@@ -65,6 +67,10 @@ router.delete("/family/:id", protect, deleteFamilyMember);
 router.post("/forgot-password", forgotPassword);
 router.get("/reset-password/:token", validateResetToken);
 router.post("/reset-password/:token", resetPassword);
+
+// Hospital Staff Invitation Routes (Single-use expiring tokens)
+router.get("/invitation/:token", validateInvitationToken);
+router.post("/accept-invitation", acceptInvitation);
 
 // Google OAuth 2.0 Gmail Sender Integration
 const googleOAuthRoutes = require("./googleOAuthRoutes");

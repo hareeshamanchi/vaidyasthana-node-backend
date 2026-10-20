@@ -8,6 +8,12 @@ const doctorLeaveSchema = new mongoose.Schema(
       required: [true, "Doctor reference is required"],
       index: true,
     },
+    hospitalId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Hospital",
+      default: null,
+      index: true,
+    },
     startDate: {
       type: Date,
       required: [true, "Leave start date is required"],

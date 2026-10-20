@@ -32,7 +32,18 @@ const reportSchema = new mongoose.Schema(
 
     uploadedByRole: {
       type: String,
-      enum: ["patient", "doctor", "admin", "hospital_admin", "receptionist", "superadmin"],
+      enum: [
+        "patient",
+        "doctor",
+        "nurse",
+        "receptionist",
+        "lab_technician",
+        "pharmacist",
+        "billing_staff",
+        "hospital_admin",
+        "admin",
+        "superadmin",
+      ],
       default: "patient",
     },
 

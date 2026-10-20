@@ -17,6 +17,8 @@ const medicationRoutes = require("./routes/medicationRoutes");
 const pushRoutes = require("./routes/pushRoutes");
 const followUpRoutes = require("./routes/followUpRoutes");
 const googleOAuthRoutes = require("./routes/googleOAuthRoutes");
+const hospitalRoutes = require("./routes/hospitalRoutes");
+const hospitalAdminRoutes = require("./routes/hospitalAdminRoutes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -97,6 +99,8 @@ app.use("/api/timeline", timelineRoutes);
 app.use("/api/medications", medicationRoutes);
 app.use("/api/push", pushRoutes);
 app.use("/api/follow-ups", followUpRoutes);
+app.use("/api/hospitals", hospitalRoutes);
+app.use("/api/hospital-admin", hospitalAdminRoutes);
 
 /*
 |--------------------------------------------------------------------------
@@ -123,6 +127,8 @@ app.get("/", (req, res) => {
       timeline: "/api/timeline",
       medications: "/api/medications",
       followUps: "/api/follow-ups",
+      hospitals: "/api/hospitals",
+      hospitalAdmin: "/api/hospital-admin",
     },
   });
 });
