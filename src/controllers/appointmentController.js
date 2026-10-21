@@ -307,7 +307,7 @@ const getDoctorsDirectory = async (req, res) => {
     // Retrieve doctors and populate hospital metadata
     const rawDoctors = await User.find(query)
       .select(
-        "_id name email phoneNumber specialization qualifications experienceYears consultationFee workingHours verificationStatus city state address hospitalId"
+        "_id name email phoneNumber specialization qualifications experienceYears consultationFee workingHours verificationStatus city state address clinicName hospitalId"
       )
       .populate("hospitalId", "name hospitalCode status")
       .sort({ name: 1 });
@@ -319,11 +319,14 @@ const getDoctorsDirectory = async (req, res) => {
       }
       return true;
     }).map((doc) => {
-      const docObj = doc.toObject();
+      const docObj = doc.toObject ? doc.toObject() : { ...doc };
       if (doc.hospitalId && typeof doc.hospitalId === "object") {
         docObj.hospitalName = doc.hospitalId.name || "";
         docObj.hospitalCode = doc.hospitalId.hospitalCode || "";
         docObj.hospitalId = doc.hospitalId._id;
+      } else {
+        docObj.hospitalName = "";
+        docObj.hospitalCode = "";
       }
       return docObj;
     });
@@ -354,7 +357,7 @@ const getDoctorsDirectory = async (req, res) => {
     });
 
     const enrichedDoctors = doctors.map((doc) => {
-      const docObj = doc.toObject();
+      const docObj = doc.toObject ? doc.toObject() : { ...doc };
       const leave = leaveByDoctor.get(doc._id.toString());
       const daySchedule = getDoctorDaySchedule(doc, targetDateStr, timezone);
 

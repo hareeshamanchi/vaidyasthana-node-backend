@@ -129,6 +129,11 @@ const userSchema = new mongoose.Schema(
     },
 
     // Clinician & Medical Verification Attributes
+    clinicName: {
+      type: String,
+      default: "",
+      trim: true,
+    },
     specialization: {
       type: String,
       default: "General Medicine",

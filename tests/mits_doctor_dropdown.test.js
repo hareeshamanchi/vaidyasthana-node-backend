@@ -46,7 +46,7 @@ test("MITS College Hospital Doctor Dropdown & Data Isolation Verification", asyn
     const jeshuDoc = resData.doctors.find((d) => d.email === "23691a3167@mits.ac.in");
     assert.ok(jeshuDoc, "Doctor Jeshu must be returned in MITS College doctor directory");
     assert.equal(jeshuDoc.name, "jeshu");
-    assert.equal(jeshuDoc.hospitalName, "mits college");
+    assert.equal(jeshuDoc.hospitalName, mitsHospital.name);
 
     // Must find Hareesh
     const hareeshDoc = resData.doctors.find((d) => d.email === "hareeshamanchi@gmail.com");
