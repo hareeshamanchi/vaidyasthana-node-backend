@@ -24,6 +24,7 @@ const {
 const {
   createHospital,
   getHospitals,
+  updateHospitalStatus,
 } = require("../src/controllers/hospitalController");
 const {
   createStaffMember,
@@ -412,7 +413,9 @@ test("10. Staff Invitation Acceptance - Single-use token marks invitation accept
   const originalFindOneInvite = HospitalInvitation.findOne;
   const originalFindOneUser = User.findOne;
   const originalCreateUser = User.create;
+  const originalFindByIdHospital = Hospital.findById;
 
+  Hospital.findById = async () => ({ _id: hospitalId, name: "City Hospital", status: "active" });
   HospitalInvitation.findOne = () => mockInvitation;
   User.findOne = () => null; // New user
   User.create = async (data) => ({
@@ -452,6 +455,7 @@ test("10. Staff Invitation Acceptance - Single-use token marks invitation accept
     HospitalInvitation.findOne = originalFindOneInvite;
     User.findOne = originalFindOneUser;
     User.create = originalCreateUser;
+    Hospital.findById = originalFindByIdHospital;
   }
 });
 
@@ -583,6 +587,9 @@ test("13. Superadmin cannot accept a hospital staff invitation", async () => {
   const rawToken = crypto.randomBytes(32).toString("hex");
   const originalFindOneInvite = HospitalInvitation.findOne;
   const originalFindOneUser = User.findOne;
+  const originalFindByIdHospital = Hospital.findById;
+
+  Hospital.findById = async () => ({ _id: new mongoose.Types.ObjectId(), name: "City Hospital", status: "active" });
 
   HospitalInvitation.findOne = async () => ({
     _id: new mongoose.Types.ObjectId(),
@@ -622,5 +629,260 @@ test("13. Superadmin cannot accept a hospital staff invitation", async () => {
   } finally {
     HospitalInvitation.findOne = originalFindOneInvite;
     User.findOne = originalFindOneUser;
+    Hospital.findById = originalFindByIdHospital;
   }
+});
+
+test("14. Platform Owner deactivates hospital, revoking staff session tokenVersion and preserving all records", async () => {
+  const superadminId = new mongoose.Types.ObjectId();
+  const hospitalId = new mongoose.Types.ObjectId();
+
+  const mockHospitalDoc = {
+    _id: hospitalId,
+    name: "Apollo Metro",
+    hospitalCode: "APOLLO-01",
+    status: "active",
+    save: async function () { return this; },
+  };
+
+  let updateManyFilter = null;
+  let updateManyUpdate = null;
+
+  const originalFindById = Hospital.findById;
+  const originalUpdateMany = User.updateMany;
+
+  Hospital.findById = async (id) => (id.toString() === hospitalId.toString() ? mockHospitalDoc : null);
+  User.updateMany = async (filter, update) => {
+    updateManyFilter = filter;
+    updateManyUpdate = update;
+    return { modifiedCount: 5 };
+  };
+
+  try {
+    let statusCode = 0;
+    let resData = null;
+    const mockRes = {
+      status: (code) => {
+        statusCode = code;
+        return { json: (d) => { resData = d; } };
+      },
+    };
+
+    const req = {
+      user: { _id: superadminId, role: "superadmin", email: "superadmin@vaidyasthana.com" },
+      params: { id: hospitalId.toString() },
+      body: { status: "suspended", reason: "Annual compliance review pending" },
+    };
+
+    await updateHospitalStatus(req, mockRes);
+    assert.equal(statusCode, 200);
+    assert.equal(mockHospitalDoc.status, "suspended");
+    assert.equal(updateManyFilter.hospitalId.toString(), hospitalId.toString());
+    assert.deepEqual(updateManyUpdate, { $inc: { tokenVersion: 1 } });
+    assert.ok(resData.message.includes("suspended"));
+  } finally {
+    Hospital.findById = originalFindById;
+    User.updateMany = originalUpdateMany;
+  }
+});
+
+test("15. Suspended hospital blocks creating staff members and generating staff invitations", async () => {
+  const hospitalId = new mongoose.Types.ObjectId();
+  const adminId = new mongoose.Types.ObjectId();
+
+  const suspendedHospital = {
+    _id: hospitalId,
+    name: "St. Jude Suspended",
+    status: "suspended",
+  };
+
+  const originalFindById = Hospital.findById;
+  Hospital.findById = async () => suspendedHospital;
+
+  try {
+    let statusCode = 0;
+    let resData = null;
+    const mockRes = {
+      status: (code) => {
+        statusCode = code;
+        return { json: (d) => { resData = d; } };
+      },
+    };
+
+    // Subtest A: Create staff
+    const reqCreate = {
+      user: { _id: adminId, role: "hospital_admin", hospitalId },
+      body: {
+        name: "Dr. Blocked Staff",
+        email: "blocked.staff@hospital.test",
+        password: "Password123!",
+        role: "doctor",
+      },
+    };
+
+    await createStaffMember(reqCreate, mockRes);
+    assert.equal(statusCode, 403);
+    assert.ok(resData.message.includes("Hospital tenant is currently suspended"));
+
+    // Subtest B: Invite staff
+    const reqInvite = {
+      user: { _id: adminId, role: "hospital_admin", hospitalId },
+      body: {
+        name: "Nurse Blocked",
+        email: "nurse.blocked@hospital.test",
+        role: "nurse",
+      },
+    };
+
+    await inviteStaffMember(reqInvite, mockRes);
+    assert.equal(statusCode, 403);
+    assert.ok(resData.message.includes("Hospital tenant is currently suspended"));
+  } finally {
+    Hospital.findById = originalFindById;
+  }
+});
+
+test("16. Pending invitation for a suspended hospital cannot be accepted or validated", async () => {
+  const hospitalId = new mongoose.Types.ObjectId();
+  const rawToken = crypto.randomBytes(32).toString("hex");
+
+  const originalFindOneInvite = HospitalInvitation.findOne;
+  const originalFindByIdHospital = Hospital.findById;
+
+  Hospital.findById = async () => ({
+    _id: hospitalId,
+    name: "Suspended Care Hospital",
+    status: "suspended",
+  });
+
+  HospitalInvitation.findOne = () => ({
+    populate: async () => ({
+      _id: new mongoose.Types.ObjectId(),
+      hospitalId: {
+        _id: hospitalId,
+        name: "Suspended Care Hospital",
+        status: "suspended",
+      },
+      email: "invited.staff@hospital.test",
+      role: "nurse",
+      status: "pending",
+      expiresAt: new Date(Date.now() + 86400000),
+    }),
+  });
+
+  try {
+    let statusCode = 0;
+    let resData = null;
+    const mockRes = {
+      status: (code) => {
+        statusCode = code;
+        return { json: (d) => { resData = d; } };
+      },
+    };
+
+    // Validation attempt
+    const reqValidate = { params: { token: rawToken } };
+    await validateInvitationToken(reqValidate, mockRes);
+    assert.equal(statusCode, 403);
+    assert.ok(resData.message.includes("currently suspended"));
+
+    // Acceptance attempt
+    HospitalInvitation.findOne = async () => ({
+      _id: new mongoose.Types.ObjectId(),
+      hospitalId,
+      email: "invited.staff@hospital.test",
+      role: "nurse",
+      status: "pending",
+      expiresAt: new Date(Date.now() + 86400000),
+    });
+
+    const reqAccept = {
+      body: {
+        token: rawToken,
+        password: "NewPassword123!",
+      },
+    };
+
+    await acceptInvitation(reqAccept, mockRes);
+    assert.equal(statusCode, 403);
+    assert.ok(resData.message.includes("currently suspended"));
+  } finally {
+    Hospital.findById = originalFindByIdHospital;
+    HospitalInvitation.findOne = originalFindOneInvite;
+  }
+});
+
+test("17. Platform Owner safely reactivates hospital, restoring active status on same tenant ID without data duplication", async () => {
+  const superadminId = new mongoose.Types.ObjectId();
+  const hospitalId = new mongoose.Types.ObjectId();
+
+  const mockHospitalDoc = {
+    _id: hospitalId,
+    name: "Apollo Metro",
+    hospitalCode: "APOLLO-01",
+    status: "suspended",
+    subscription: { plan: "starter", status: "suspended" },
+    save: async function () { return this; },
+  };
+
+  const originalFindById = Hospital.findById;
+  Hospital.findById = async (id) => (id.toString() === hospitalId.toString() ? mockHospitalDoc : null);
+
+  try {
+    let statusCode = 0;
+    let resData = null;
+    const mockRes = {
+      status: (code) => {
+        statusCode = code;
+        return { json: (d) => { resData = d; } };
+      },
+    };
+
+    const req = {
+      user: { _id: superadminId, role: "superadmin", email: "superadmin@vaidyasthana.com" },
+      params: { id: hospitalId.toString() },
+      body: { status: "active", reason: "Compliance audit successfully completed" },
+    };
+
+    await updateHospitalStatus(req, mockRes);
+    assert.equal(statusCode, 200);
+    assert.equal(mockHospitalDoc.status, "active");
+    assert.equal(mockHospitalDoc.subscription.status, "active");
+    assert.equal(mockHospitalDoc._id.toString(), hospitalId.toString(), "Tenant ID must remain strictly identical");
+    assert.ok(resData.message.includes("reactivated"));
+  } finally {
+    Hospital.findById = originalFindById;
+  }
+});
+
+test("18. Hospital Admin cannot change hospital tenant status (Platform Owner protected route)", () => {
+  const hospitalAdminId = new mongoose.Types.ObjectId();
+  const hospitalId = new mongoose.Types.ObjectId();
+
+  let statusCode = 0;
+  let resData = null;
+  const mockRes = {
+    status: (code) => {
+      statusCode = code;
+      return { json: (d) => { resData = d; } };
+    },
+  };
+
+  const req = {
+    user: {
+      _id: hospitalAdminId,
+      role: "hospital_admin",
+      hospitalId,
+      email: "hospadmin@citycare.test",
+    },
+  };
+
+  let nextCalled = false;
+  requirePlatformOwner(req, mockRes, () => {
+    nextCalled = true;
+  });
+
+  assert.equal(nextCalled, false);
+  assert.equal(statusCode, 403);
+  assert.ok(resData.message.includes("Platform Owner"));
 });

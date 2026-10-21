@@ -249,6 +249,13 @@ const createStaffMember = async (req, res) => {
       });
     }
 
+    if (hospital.status === "suspended" || hospital.status === "deactivated") {
+      return res.status(403).json({
+        success: false,
+        message: `Hospital tenant is currently ${hospital.status}. Adding staff members is suspended until reactivated by the Platform Owner.`,
+      });
+    }
+
     // Check quota limits
     if (role === "doctor") {
       const currentDocCount = await User.countDocuments({ hospitalId, role: "doctor" });
@@ -357,6 +364,22 @@ const inviteStaffMember = async (req, res) => {
       });
     }
 
+    // Verify hospital status before generating invitations
+    const hospital = await Hospital.findById(hospitalId);
+    if (!hospital) {
+      return res.status(404).json({
+        success: false,
+        message: "Hospital tenant not found.",
+      });
+    }
+
+    if (hospital.status === "suspended" || hospital.status === "deactivated") {
+      return res.status(403).json({
+        success: false,
+        message: `Hospital tenant is currently ${hospital.status}. Generating staff invitations is suspended until reactivated by the Platform Owner.`,
+      });
+    }
+
     const { invitation, rawToken } = await HospitalInvitation.createInvitation({
       hospitalId,
       email,
@@ -370,21 +393,17 @@ const inviteStaffMember = async (req, res) => {
     const frontendUrl = process.env.FRONTEND_URL || "https://vaidyasthana-frontend.onrender.com";
     const fullSetupUrl = `${frontendUrl.replace(/\/$/, "")}${setupLink}`;
 
-    // Look up hospital name for polite invitation email
-    Hospital.findById(hospitalId)
-      .then((hosp) => {
-        sendHospitalInvitationEmail({
-          to: email,
-          name,
-          hospitalName: hosp?.name || "our hospital",
-          role,
-          setupLink: fullSetupUrl,
-          expiresAt: invitation.expiresAt,
-        }).catch((err) => {
-          console.warn("[SAFE_DIAGNOSTIC] Staff invite email dispatch warning:", err.message);
-        });
-      })
-      .catch(() => {});
+    // Send polite invitation email
+    sendHospitalInvitationEmail({
+      to: email,
+      name,
+      hospitalName: hospital.name || "our hospital",
+      role,
+      setupLink: fullSetupUrl,
+      expiresAt: invitation.expiresAt,
+    }).catch((err) => {
+      console.warn("[SAFE_DIAGNOSTIC] Staff invite email dispatch warning:", err.message);
+    });
 
     recordAuditEvent({
       eventType: "STAFF_INVITED",
@@ -643,6 +662,21 @@ const registerHospitalPatient = async (req, res) => {
       });
     }
 
+    const hospital = await Hospital.findById(hospitalId);
+    if (!hospital) {
+      return res.status(404).json({
+        success: false,
+        message: "Hospital tenant not found.",
+      });
+    }
+
+    if (hospital.status === "suspended" || hospital.status === "deactivated") {
+      return res.status(403).json({
+        success: false,
+        message: `Hospital tenant is currently ${hospital.status}. Patient registrations are suspended until reactivated by the Platform Owner.`,
+      });
+    }
+
     const cleanEmail = email.toLowerCase().trim();
     let patient = await User.findOne({ email: cleanEmail });
 
@@ -786,6 +820,13 @@ const updateHospitalSettings = async (req, res) => {
       return res.status(404).json({
         success: false,
         message: "Hospital tenant not found.",
+      });
+    }
+
+    if (hospital.status === "suspended" || hospital.status === "deactivated") {
+      return res.status(403).json({
+        success: false,
+        message: `Hospital tenant is currently ${hospital.status}. Adding staff members is suspended until reactivated by the Platform Owner.`,
       });
     }
 

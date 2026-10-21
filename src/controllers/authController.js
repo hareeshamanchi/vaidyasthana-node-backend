@@ -1,4 +1,5 @@
 const User = require("../models/User");
+const Hospital = require("../models/Hospital");
 const HospitalInvitation = require("../models/HospitalInvitation");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
@@ -1841,12 +1842,19 @@ const validateInvitationToken = async (req, res) => {
       tokenHash,
       status: "pending",
       expiresAt: { $gt: new Date() },
-    }).populate("hospitalId", "name hospitalCode timezone branding");
+    }).populate("hospitalId", "name hospitalCode timezone branding status");
 
     if (!invitation) {
       return res.status(400).json({
         success: false,
         message: "This invitation link is invalid, expired, or has already been used.",
+      });
+    }
+
+    if (invitation.hospitalId && (invitation.hospitalId.status === "suspended" || invitation.hospitalId.status === "deactivated")) {
+      return res.status(403).json({
+        success: false,
+        message: `This invitation belongs to a hospital tenant that is currently ${invitation.hospitalId.status}. Please contact the Platform Owner.`,
       });
     }
 
@@ -1902,6 +1910,15 @@ const acceptInvitation = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "This invitation link is invalid, expired, or has already been used.",
+      });
+    }
+
+    // Verify hospital status before allowing invitation acceptance
+    const hospital = await Hospital.findById(invitation.hospitalId);
+    if (!hospital || hospital.status === "suspended" || hospital.status === "deactivated") {
+      return res.status(403).json({
+        success: false,
+        message: `Cannot accept invitation: Hospital '${hospital?.name || "Institution"}' is currently ${hospital?.status || "inactive"}. Please contact the Platform Owner.`,
       });
     }
 

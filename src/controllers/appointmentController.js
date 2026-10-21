@@ -1,5 +1,6 @@
 const Appointment = require("../models/Appointment");
 const User = require("../models/User");
+const Hospital = require("../models/Hospital");
 const FamilyMember = require("../models/FamilyMember");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
@@ -648,6 +649,16 @@ const createAppointment = async (req, res) => {
         verifiedFamilyMember = await FamilyMember.findOne({
           _id: familyMemberId,
           primaryAccountId: patientUser._id,
+        });
+      }
+    }
+
+    if (targetDoctor.hospitalId) {
+      const doctorHospital = await Hospital.findById(targetDoctor.hospitalId);
+      if (doctorHospital && (doctorHospital.status === "suspended" || doctorHospital.status === "deactivated")) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot schedule appointment: Doctor's affiliated hospital (${doctorHospital.name}) is currently ${doctorHospital.status}.`,
         });
       }
     }

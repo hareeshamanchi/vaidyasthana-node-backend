@@ -1,3 +1,4 @@
+const mongoose = require("mongoose");
 const Hospital = require("../models/Hospital");
 const HospitalInvitation = require("../models/HospitalInvitation");
 const User = require("../models/User");
@@ -407,6 +408,13 @@ const updateHospitalStatus = async (req, res) => {
     const { id } = req.params;
     const { status, reason } = req.body;
 
+    if (!mongoose.Types.ObjectId.isValid(id)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid hospital ID format.",
+      });
+    }
+
     if (!["active", "suspended", "deactivated"].includes(status)) {
       return res.status(400).json({
         success: false,
@@ -422,10 +430,33 @@ const updateHospitalStatus = async (req, res) => {
       });
     }
 
+    if (hospital.status === status) {
+      return res.status(400).json({
+        success: false,
+        message: `Hospital is already in '${status}' status.`,
+      });
+    }
+
+    const previousStatus = hospital.status;
     hospital.status = status;
+
+    // When reactivating, ensure institutional subscription remains active
+    if (status === "active") {
+      if (!hospital.subscription) {
+        hospital.subscription = {
+          plan: "trial",
+          status: "trial",
+          maxDoctors: 20,
+          maxStaff: 50,
+        };
+      } else if (hospital.subscription.status === "suspended") {
+        hospital.subscription.status = "active";
+      }
+    }
+
     await hospital.save();
 
-    // If suspended or deactivated, increment tokenVersion of all hospital staff to force re-auth
+    // If suspended or deactivated, increment tokenVersion of all hospital staff to force session invalidation
     if (status === "suspended" || status === "deactivated") {
       await User.updateMany(
         { hospitalId: hospital._id },
@@ -434,21 +465,22 @@ const updateHospitalStatus = async (req, res) => {
     }
 
     recordAuditEvent({
-      eventType: "HOSPITAL_STATUS_CHANGED",
+      eventType: status === "active" ? "HOSPITAL_REACTIVATED" : "HOSPITAL_SUSPENDED",
       actor: req.user,
-      action: `Changed status of hospital ${hospital.name} to '${status}'`,
+      action: `Changed status of hospital '${hospital.name}' (${hospital.hospitalCode}) from '${previousStatus}' to '${status}'`,
       outcome: "success",
       targetId: hospital._id,
-      reason: reason || "Platform administrative action",
+      reason: reason ? reason.trim() : (status === "active" ? "Platform Owner reactivation" : "Platform Owner deactivation/suspension"),
       req,
     });
 
     return res.status(200).json({
       success: true,
-      message: `Hospital tenant status changed to '${status}'.`,
+      message: `Hospital '${hospital.name}' has been successfully ${status === "active" ? "reactivated" : status}.`,
       hospital,
     });
   } catch (error) {
+    console.error("Error updating hospital status:", error);
     return res.status(500).json({
       success: false,
       message: "Failed to update hospital status.",
