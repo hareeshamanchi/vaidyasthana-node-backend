@@ -42,6 +42,7 @@ const notificationSchema = new mongoose.Schema(
         "appointment_reschedule_needed",
         "doctor_leave_scheduled",
         "doctor_leave_cancelled",
+        "prescription_issued",
         "general",
       ],
       default: "general",

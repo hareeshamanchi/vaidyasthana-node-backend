@@ -19,6 +19,7 @@ const followUpRoutes = require("./routes/followUpRoutes");
 const googleOAuthRoutes = require("./routes/googleOAuthRoutes");
 const hospitalRoutes = require("./routes/hospitalRoutes");
 const hospitalAdminRoutes = require("./routes/hospitalAdminRoutes");
+const prescriptionRoutes = require("./routes/prescriptionRoutes");
 const errorHandler = require("./middleware/errorHandler");
 
 const app = express();
@@ -101,6 +102,7 @@ app.use("/api/push", pushRoutes);
 app.use("/api/follow-ups", followUpRoutes);
 app.use("/api/hospitals", hospitalRoutes);
 app.use("/api/hospital-admin", hospitalAdminRoutes);
+app.use("/api/prescriptions", prescriptionRoutes);
 
 /*
 |--------------------------------------------------------------------------
