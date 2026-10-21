@@ -1940,6 +1940,9 @@ const acceptInvitation = async (req, res) => {
       user.role = invitation.role;
       user.hospitalId = invitation.hospitalId;
       user.status = "active";
+      if (invitation.role === "doctor") {
+        user.verificationStatus = "verified";
+      }
       if (name) user.name = name.trim();
       if (phoneNumber) user.phoneNumber = phoneNumber;
       await user.save();
@@ -1952,6 +1955,7 @@ const acceptInvitation = async (req, res) => {
         role: invitation.role,
         hospitalId: invitation.hospitalId,
         status: "active",
+        verificationStatus: invitation.role === "doctor" ? "verified" : "not_submitted",
       });
     }
 

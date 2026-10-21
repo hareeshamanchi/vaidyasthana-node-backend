@@ -404,8 +404,10 @@ const uploadVerificationDocuments = async (req, res) => {
     }
 
     doctor.verificationDocuments.push(...uploadedDocs);
-    // Move to pending review state upon submission
-    doctor.verificationStatus = "pending";
+    // Move to pending review state upon submission for independent doctors
+    if (!doctor.hospitalId) {
+      doctor.verificationStatus = "pending";
+    }
 
     if (req.body.medicalRegistrationNumber) {
       doctor.medicalRegistrationNumber = req.body.medicalRegistrationNumber.trim();

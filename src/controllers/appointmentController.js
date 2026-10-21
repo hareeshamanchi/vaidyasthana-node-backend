@@ -272,17 +272,61 @@ const getDoctorsDirectory = async (req, res) => {
       });
     }
 
-    const { date, timezone } = req.query;
+    const { date, timezone, hospitalId } = req.query;
+    const requestedHospitalId = hospitalId || req.user?.hospitalId;
 
-    // Only return doctors whose medical credentials have been verified
-    const doctors = await User.find({
+    let query = {
       role: "doctor",
-      verificationStatus: "verified",
-    })
+      status: "active",
+    };
+
+    if (requestedHospitalId) {
+      if (!mongoose.Types.ObjectId.isValid(requestedHospitalId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid hospitalId format.",
+        });
+      }
+
+      const hospitalDoc = await Hospital.findById(requestedHospitalId);
+      if (!hospitalDoc || hospitalDoc.status === "suspended" || hospitalDoc.status === "deactivated") {
+        return res.status(403).json({
+          success: false,
+          message: `Cannot load doctors: Hospital is currently ${hospitalDoc?.status || "inactive"}.`,
+        });
+      }
+
+      // Hospital scoped: only active doctors belonging to this hospital
+      query.hospitalId = new mongoose.Types.ObjectId(requestedHospitalId);
+      query.verificationStatus = { $ne: "rejected" };
+    } else {
+      // General directory: verified active doctors
+      query.verificationStatus = "verified";
+    }
+
+    // Retrieve doctors and populate hospital metadata
+    const rawDoctors = await User.find(query)
       .select(
-        "_id name email phoneNumber specialization qualifications experienceYears consultationFee workingHours verificationStatus city state address"
+        "_id name email phoneNumber specialization qualifications experienceYears consultationFee workingHours verificationStatus city state address hospitalId"
       )
+      .populate("hospitalId", "name hospitalCode status")
       .sort({ name: 1 });
+
+    // Exclude doctors affiliated with suspended or deactivated hospitals
+    const doctors = rawDoctors.filter((doc) => {
+      if (doc.hospitalId && typeof doc.hospitalId === "object" && doc.hospitalId.status) {
+        return doc.hospitalId.status === "active";
+      }
+      return true;
+    }).map((doc) => {
+      const docObj = doc.toObject();
+      if (doc.hospitalId && typeof doc.hospitalId === "object") {
+        docObj.hospitalName = doc.hospitalId.name || "";
+        docObj.hospitalCode = doc.hospitalId.hospitalCode || "";
+        docObj.hospitalId = doc.hospitalId._id;
+      }
+      return docObj;
+    });
 
     if (!date) {
       return res.status(200).json({
@@ -384,7 +428,8 @@ const getAvailableSlots = async (req, res) => {
       });
     }
 
-    if (doctor.verificationStatus !== "verified") {
+    const isHospitalDoctor = Boolean(doctor.hospitalId && doctor.status === "active" && doctor.verificationStatus !== "rejected");
+    if (doctor.verificationStatus !== "verified" && !isHospitalDoctor) {
       return res.status(403).json({
         success: false,
         message: "Doctor is not currently verified to accept clinical appointments.",
