@@ -454,3 +454,173 @@ test("10. Staff Invitation Acceptance - Single-use token marks invitation accept
     User.create = originalCreateUser;
   }
 });
+
+test("11. Platform Owner cannot be demoted or assigned as initial hospital admin", async () => {
+  const superadminId = new mongoose.Types.ObjectId();
+  const superadminEmail = "superadmin@vaidyasthana.com";
+
+  let statusCode = 0;
+  let resData = null;
+  const mockRes = {
+    status: (code) => {
+      statusCode = code;
+      return { json: (d) => { resData = d; } };
+    },
+  };
+
+  const originalFindOneUser = User.findOne;
+  const originalFindOneHospital = Hospital.findOne;
+  const originalCreateHospital = Hospital.create;
+
+  Hospital.findOne = async () => null; // Unique code
+  Hospital.create = async (doc) => ({ _id: new mongoose.Types.ObjectId(), ...doc });
+  User.findOne = async ({ email }) => {
+    if (email === "other.super@vaidyasthana.com") {
+      return { _id: new mongoose.Types.ObjectId(), email, role: "superadmin" };
+    }
+    return null;
+  };
+
+  try {
+    // Case A: Platform Owner uses their own email
+    const reqOwn = {
+      user: { _id: superadminId, email: superadminEmail, role: "superadmin" },
+      body: {
+        name: "City Multispecialty",
+        hospitalCode: "CITY-101",
+        contactEmail: "info@city.test",
+        initialAdmin: {
+          email: superadminEmail, // Own email!
+        },
+      },
+    };
+
+    await createHospital(reqOwn, mockRes);
+    assert.equal(statusCode, 400);
+    assert.ok(resData.message.includes("Platform Owner cannot designate their own"));
+
+    // Case B: Existing superadmin user targeted
+    const reqOther = {
+      user: { _id: superadminId, email: superadminEmail, role: "superadmin" },
+      body: {
+        name: "City Multispecialty 2",
+        hospitalCode: "CITY-102",
+        contactEmail: "info2@city.test",
+        initialAdmin: {
+          email: "other.super@vaidyasthana.com",
+        },
+      },
+    };
+
+    await createHospital(reqOther, mockRes);
+    assert.equal(statusCode, 400);
+    assert.ok(resData.message.includes("cannot be assigned as a hospital-level administrator"));
+  } finally {
+    User.findOne = originalFindOneUser;
+    Hospital.findOne = originalFindOneHospital;
+    Hospital.create = originalCreateHospital;
+  }
+});
+
+test("12. createHospital assigns newly created hospital _id as hospitalId on initial admin", async () => {
+  const superadminId = new mongoose.Types.ObjectId();
+  const newHospitalId = new mongoose.Types.ObjectId();
+  const adminEmail = "new.admin@cityhospital.test";
+
+  let createdAdmin = null;
+
+  const originalFindOneHospital = Hospital.findOne;
+  const originalCreateHospital = Hospital.create;
+  const originalFindOneUser = User.findOne;
+  const originalCreateUser = User.create;
+
+  Hospital.findOne = async () => null;
+  Hospital.create = async (doc) => ({ _id: newHospitalId, ...doc });
+  User.findOne = async () => null; // New user
+  User.create = async (data) => {
+    createdAdmin = data;
+    return { _id: new mongoose.Types.ObjectId(), ...data };
+  };
+
+  try {
+    let statusCode = 0;
+    let resData = null;
+    const mockRes = {
+      status: (code) => {
+        statusCode = code;
+        return { json: (d) => { resData = d; } };
+      },
+    };
+
+    const req = {
+      user: { _id: superadminId, email: "superadmin@vaidyasthana.com", role: "superadmin" },
+      body: {
+        name: "Metro General Hospital",
+        hospitalCode: "METRO-001",
+        contactEmail: "contact@metro.test",
+        initialAdmin: {
+          name: "Dr. Metro Administrator",
+          email: adminEmail,
+          password: "SecureMasterPassword123!",
+        },
+      },
+    };
+
+    await createHospital(req, mockRes);
+    assert.equal(statusCode, 201);
+    assert.ok(createdAdmin, "Initial admin must be created");
+    assert.equal(createdAdmin.role, "hospital_admin");
+    assert.equal(createdAdmin.hospitalId.toString(), newHospitalId.toString(), "Admin must be bound to new hospital _id");
+  } finally {
+    Hospital.findOne = originalFindOneHospital;
+    Hospital.create = originalCreateHospital;
+    User.findOne = originalFindOneUser;
+    User.create = originalCreateUser;
+  }
+});
+
+test("13. Superadmin cannot accept a hospital staff invitation", async () => {
+  const rawToken = crypto.randomBytes(32).toString("hex");
+  const originalFindOneInvite = HospitalInvitation.findOne;
+  const originalFindOneUser = User.findOne;
+
+  HospitalInvitation.findOne = async () => ({
+    _id: new mongoose.Types.ObjectId(),
+    hospitalId: new mongoose.Types.ObjectId(),
+    email: "superadmin@vaidyasthana.com",
+    role: "hospital_admin",
+    status: "pending",
+    expiresAt: new Date(Date.now() + 86400000),
+  });
+
+  User.findOne = async () => ({
+    _id: new mongoose.Types.ObjectId(),
+    email: "superadmin@vaidyasthana.com",
+    role: "superadmin", // Existing user is a superadmin!
+  });
+
+  try {
+    let statusCode = 0;
+    let resData = null;
+    const mockRes = {
+      status: (code) => {
+        statusCode = code;
+        return { json: (d) => { resData = d; } };
+      },
+    };
+
+    const req = {
+      body: {
+        token: rawToken,
+        password: "NewPassword123!",
+      },
+    };
+
+    await acceptInvitation(req, mockRes);
+    assert.equal(statusCode, 400);
+    assert.ok(resData.message.includes("Platform Owner (superadmin) cannot accept a hospital staff invitation"));
+  } finally {
+    HospitalInvitation.findOne = originalFindOneInvite;
+    User.findOne = originalFindOneUser;
+  }
+});

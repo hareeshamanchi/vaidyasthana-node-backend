@@ -1908,6 +1908,13 @@ const acceptInvitation = async (req, res) => {
     // Check if user already exists
     let user = await User.findOne({ email: invitation.email.toLowerCase() });
 
+    if (user && user.role === "superadmin") {
+      return res.status(400).json({
+        success: false,
+        message: "A Platform Owner (superadmin) cannot accept a hospital staff invitation. Please use a distinct hospital administrator account.",
+      });
+    }
+
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
 

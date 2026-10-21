@@ -41,23 +41,62 @@ const runBootstrap = async () => {
     const address = "Vaidyasthana National Healthcare Governance Center, Bengaluru, Karnataka";
 
     const isForceReset = process.argv.includes("--reset-password");
+    const isInspect = process.argv.includes("--inspect");
 
     let existingSuperadmin = await User.findOne({ email });
 
+    if (isInspect) {
+      console.log("\n==========================================");
+      console.log("  Vaidyasthana Account Inspection Mode");
+      console.log("==========================================");
+      console.log(`Target Email:        ${email}`);
+      if (!existingSuperadmin) {
+        console.log("Account Exists:      NO");
+        console.log("Status:              Account not found in MongoDB Atlas.");
+      } else {
+        console.log("Account Exists:      YES");
+        console.log(`Name:                ${existingSuperadmin.name}`);
+        console.log(`Actual Role in DB:   ${existingSuperadmin.role}`);
+        console.log(`Account Status:      ${existingSuperadmin.status}`);
+        console.log(`Hospital ID:         ${existingSuperadmin.hospitalId || "null (Platform Wide)"}`);
+        console.log(`Two-Factor Enabled:  ${Boolean(existingSuperadmin.twoFactorEnabled)}`);
+        console.log(`Token Version:       ${existingSuperadmin.tokenVersion || 0}`);
+        console.log(`Created At:          ${existingSuperadmin.createdAt}`);
+        console.log(`Updated At:          ${existingSuperadmin.updatedAt}`);
+      }
+      console.log("==========================================\n(Read-only inspection complete. No database changes made.)\n");
+      await mongoose.disconnect();
+      return process.exit(0);
+    }
+
     if (existingSuperadmin && !isForceReset) {
-      // Idempotent: ensure role and active status are preserved
+      // Idempotent: ensure role, active status, and platform-wide tenancy (hospitalId = null) are preserved
       let updated = false;
       if (existingSuperadmin.role !== "superadmin") {
+        console.log(`[RECOVERY] Account role was '${existingSuperadmin.role}'. Restoring to 'superadmin'.`);
         existingSuperadmin.role = "superadmin";
         updated = true;
       }
       if (existingSuperadmin.status !== "active") {
+        console.log(`[RECOVERY] Account status was '${existingSuperadmin.status}'. Restoring to 'active'.`);
         existingSuperadmin.status = "active";
+        updated = true;
+      }
+      if (existingSuperadmin.hospitalId) {
+        console.log(`[RECOVERY] Account was bound to hospitalId '${existingSuperadmin.hospitalId}'. Clearing to null (Platform Owner).`);
+        existingSuperadmin.hospitalId = null;
         updated = true;
       }
       if (updated) {
         await existingSuperadmin.save();
-        console.log(`✔ Updated existing account (${email}) to active 'superadmin' role.`);
+        await recordAuditEvent({
+          eventType: "SUPERADMIN_ROLE_RESTORED_CLI",
+          actor: existingSuperadmin,
+          action: "Superadmin role restored and dissociated from tenant via CLI bootstrap",
+          outcome: "success",
+          details: { email },
+        });
+        console.log(`✔ Successfully restored account (${email}) to active 'superadmin' role with platform-wide scope.`);
       } else {
         console.log(`✔ Super Administrator already configured and active (${email}). No changes needed.`);
       }
@@ -83,6 +122,7 @@ const runBootstrap = async () => {
       existingSuperadmin.password = hashedPassword;
       existingSuperadmin.role = "superadmin";
       existingSuperadmin.status = "active";
+      existingSuperadmin.hospitalId = null;
       await existingSuperadmin.save();
 
       await recordAuditEvent({

@@ -4,6 +4,7 @@ const User = require("../models/User");
 const Appointment = require("../models/Appointment");
 const bcrypt = require("bcryptjs");
 const { recordAuditEvent } = require("../services/auditService");
+const { sendHospitalInvitationEmail } = require("../services/emailService");
 
 /**
  * Onboard a new Hospital Tenant (Platform Owner only)
@@ -36,6 +37,42 @@ const createHospital = async (req, res) => {
     }
 
     const cleanCode = hospitalCode.trim().toUpperCase();
+
+    let existingAdminUser = null;
+    let adminEmail = null;
+
+    // Validate initial hospital admin setup prior to creating tenant record
+    if (initialAdmin && initialAdmin.email) {
+      adminEmail = initialAdmin.email.toLowerCase().trim();
+
+      // Guard: Platform Owner cannot assign their own superadmin account as a hospital admin
+      if (req.user && req.user.role === "superadmin" && adminEmail === req.user.email.toLowerCase().trim()) {
+        return res.status(400).json({
+          success: false,
+          message: "Platform Owner cannot designate their own superadmin account as a hospital administrator. Please provide a separate email address for the hospital administrator.",
+        });
+      }
+
+      existingAdminUser = await User.findOne({ email: adminEmail });
+
+      if (existingAdminUser) {
+        // Guard: Prevent any superadmin from being demoted or bound to a single hospital
+        if (existingAdminUser.role === "superadmin") {
+          return res.status(400).json({
+            success: false,
+            message: `The account '${adminEmail}' is a Platform Owner (superadmin) and cannot be assigned as a hospital-level administrator. Please provide a distinct email address for the hospital administrator.`,
+          });
+        }
+
+        // Associate existing user if not already attached to another hospital
+        if (existingAdminUser.hospitalId) {
+          return res.status(400).json({
+            success: false,
+            message: `User with email ${adminEmail} is already affiliated with another hospital tenant.`,
+          });
+        }
+      }
+    }
 
     // Check code uniqueness
     const existingCode = await Hospital.findOne({ hospitalCode: cleanCode });
@@ -78,25 +115,16 @@ const createHospital = async (req, res) => {
     let inviteResult = null;
 
     // Optional initial hospital admin setup
-    if (initialAdmin && initialAdmin.email) {
-      const adminEmail = initialAdmin.email.toLowerCase().trim();
-      const existingUser = await User.findOne({ email: adminEmail });
-
-      if (existingUser) {
-        // Associate existing user if not already attached to another hospital
-        if (existingUser.hospitalId && existingUser.hospitalId.toString() !== hospital._id.toString()) {
-          return res.status(400).json({
-            success: false,
-            message: `User with email ${adminEmail} is already affiliated with another hospital tenant.`,
-          });
-        }
-        existingUser.role = "hospital_admin";
-        existingUser.hospitalId = hospital._id;
-        await existingUser.save();
+    if (adminEmail) {
+      if (existingAdminUser) {
+        existingAdminUser.role = "hospital_admin";
+        existingAdminUser.hospitalId = hospital._id;
+        if (initialAdmin.name) existingAdminUser.name = initialAdmin.name.trim();
+        await existingAdminUser.save();
         adminResult = {
-          id: existingUser._id,
-          name: existingUser.name,
-          email: existingUser.email,
+          id: existingAdminUser._id,
+          name: existingAdminUser.name,
+          email: existingAdminUser.email,
           role: "hospital_admin",
         };
       } else if (initialAdmin.password) {
@@ -131,11 +159,27 @@ const createHospital = async (req, res) => {
           expiryDays: 7,
         });
 
+        const setupLink = `/accept-invitation?token=${rawToken}`;
+        const frontendUrl = process.env.FRONTEND_URL || "https://vaidyasthana-frontend.onrender.com";
+        const fullSetupUrl = `${frontendUrl.replace(/\/$/, "")}${setupLink}`;
+
+        // Attempt asynchronous email dispatch without blocking API response
+        sendHospitalInvitationEmail({
+          to: adminEmail,
+          name: initialAdmin.name,
+          hospitalName: hospital.name,
+          role: "hospital_admin",
+          setupLink: fullSetupUrl,
+          expiresAt: invitation.expiresAt,
+        }).catch((err) => {
+          console.warn("[SAFE_DIAGNOSTIC] Hospital admin invite email dispatch warning:", err.message);
+        });
+
         inviteResult = {
           invitationId: invitation._id,
           token: rawToken,
           expiresAt: invitation.expiresAt,
-          setupLink: `/accept-invitation?token=${rawToken}`,
+          setupLink,
         };
       }
     }

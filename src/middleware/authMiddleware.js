@@ -194,7 +194,25 @@ const requirePlatformOwner = (req, res, next) => {
   next();
 };
 
-const requireSuperAdmin = requirePlatformOwner;
+const requireSuperAdmin = (req, res, next) => {
+  if (!req.user || (req.user.role !== "superadmin" && req.user.role !== "admin")) {
+    recordAuditEvent({
+      eventType: "UNAUTHORIZED_ADMIN_ATTEMPT",
+      actor: req.user,
+      action: "Superadmin route access attempt",
+      outcome: "failure",
+      reason: `Role '${req.user?.role || "unknown"}' lacks administrative privilege.`,
+      req,
+    });
+
+    return res.status(403).json({
+      success: false,
+      message: "Forbidden: Super Administrator access required.",
+    });
+  }
+  next();
+};
+
 const requireStrictSuperAdmin = requirePlatformOwner;
 
 /**

@@ -6,6 +6,7 @@ const HospitalInvitation = require("../models/HospitalInvitation");
 const Appointment = require("../models/Appointment");
 const { canManageRole, HOSPITAL_STAFF_ROLES } = require("../config/permissions");
 const { recordAuditEvent } = require("../services/auditService");
+const { sendHospitalInvitationEmail } = require("../services/emailService");
 
 /**
  * Helper to determine effective hospital ID strictly from server-side trusted identity.
@@ -365,6 +366,26 @@ const inviteStaffMember = async (req, res) => {
       expiryDays: expiryDays ? Number(expiryDays) : 7,
     });
 
+    const setupLink = `/accept-invitation?token=${rawToken}`;
+    const frontendUrl = process.env.FRONTEND_URL || "https://vaidyasthana-frontend.onrender.com";
+    const fullSetupUrl = `${frontendUrl.replace(/\/$/, "")}${setupLink}`;
+
+    // Look up hospital name for polite invitation email
+    Hospital.findById(hospitalId)
+      .then((hosp) => {
+        sendHospitalInvitationEmail({
+          to: email,
+          name,
+          hospitalName: hosp?.name || "our hospital",
+          role,
+          setupLink: fullSetupUrl,
+          expiresAt: invitation.expiresAt,
+        }).catch((err) => {
+          console.warn("[SAFE_DIAGNOSTIC] Staff invite email dispatch warning:", err.message);
+        });
+      })
+      .catch(() => {});
+
     recordAuditEvent({
       eventType: "STAFF_INVITED",
       actor: req.user,
@@ -383,7 +404,7 @@ const inviteStaffMember = async (req, res) => {
         role: invitation.role,
         expiresAt: invitation.expiresAt,
         token: rawToken,
-        setupLink: `/accept-invitation?token=${rawToken}`,
+        setupLink,
       },
     });
   } catch (error) {

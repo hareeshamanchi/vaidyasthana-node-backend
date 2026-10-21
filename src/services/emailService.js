@@ -1074,12 +1074,95 @@ const sendPasswordResetEmail = async (options = {}) => {
   };
 };
 
+/**
+ * Dispatches a hospital onboarding or staff invitation email via the active email provider.
+ */
+const sendHospitalInvitationEmail = async ({ to, name, hospitalName, role, setupLink, expiresAt }) => {
+  if (!isEmailConfigured()) {
+    return {
+      accepted: false,
+      delivered: false,
+      provider: "NONE",
+      reason: "EMAIL_NOT_CONFIGURED",
+    };
+  }
+
+  if (isTestPlaceholderEmail(to)) {
+    return {
+      accepted: true,
+      delivered: true,
+      provider: "MOCK",
+      reason: "TEST_FIXTURE_BYPASS",
+    };
+  }
+
+  const roleName = role ? role.replace(/_/g, " ").toUpperCase() : "STAFF";
+  const subject = `Invitation to join ${hospitalName || "Vaidyasthana Hospital"} as ${roleName}`;
+  const html = `
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; color: #1e293b; background: #ffffff; border-radius: 8px; border: 1px solid #e2e8f0;">
+      <h2 style="color: #0d9488; margin-top: 0;">Vaidyasthana Healthcare Platform</h2>
+      <p>Hello ${name || "Healthcare Professional"},</p>
+      <p>You have been invited to join <strong>${hospitalName || "our hospital"}</strong> as <strong>${roleName}</strong> on the Vaidyasthana Multi-Hospital Platform.</p>
+      <p>Please click the button below to establish your password and activate your account:</p>
+      <div style="text-align: center; margin: 30px 0;">
+        <a href="${setupLink}" style="background-color: #0d9488; color: #ffffff; padding: 12px 24px; border-radius: 6px; text-decoration: none; font-weight: bold; display: inline-block;">
+          Activate Account & Set Password
+        </a>
+      </div>
+      <p style="font-size: 13px; color: #64748b;">Or paste this link into your browser: <br/><a href="${setupLink}" style="color: #0d9488;">${setupLink}</a></p>
+      <p style="font-size: 13px; color: #64748b;">This invitation link will expire on ${expiresAt ? new Date(expiresAt).toLocaleDateString() : "7 days"}.</p>
+    </div>
+  `;
+
+  const resendCfg = getResendConfig();
+  if (resendCfg.configured) {
+    try {
+      const resendClient = new Resend(resendCfg.apiKey);
+      const res = await resendClient.emails.send({
+        from: resendCfg.from,
+        to: [to],
+        subject,
+        html,
+      });
+      return { accepted: true, delivered: true, provider: "RESEND", messageId: res.data?.id };
+    } catch (err) {
+      console.warn("[SAFE_DIAGNOSTIC] Resend invitation dispatch warning:", err.message);
+      return { accepted: false, delivered: false, provider: "RESEND", reason: err.message };
+    }
+  }
+
+  const smtpCfg = getSmtpConfig();
+  if (smtpCfg.configured) {
+    try {
+      const transporter = nodemailer.createTransport({
+        host: smtpCfg.host,
+        port: smtpCfg.port,
+        secure: smtpCfg.secure,
+        auth: { user: smtpCfg.user, pass: smtpCfg.pass },
+      });
+      const info = await transporter.sendMail({
+        from: smtpCfg.from || smtpCfg.user,
+        to,
+        subject,
+        html,
+      });
+      return { accepted: true, delivered: true, provider: "SMTP", messageId: info.messageId };
+    } catch (err) {
+      console.warn("[SAFE_DIAGNOSTIC] SMTP invitation dispatch warning:", err.message);
+      return { accepted: false, delivered: false, provider: "SMTP", reason: err.message };
+    }
+  }
+
+  return { accepted: false, delivered: false, provider: "NONE", reason: "EMAIL_NOT_CONFIGURED" };
+};
+
 module.exports = {
   isEmailConfigured,
   getEmailProvider,
   getResendConfig,
   getSmtpConfig,
   sendPasswordResetEmail,
+  sendHospitalInvitationEmail,
   sendViaGmailOAuth,
   sendViaResend,
   sendViaSmtp,
