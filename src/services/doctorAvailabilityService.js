@@ -500,8 +500,9 @@ const calculateDoctorSlots = async (arg1, arg2, arg3) => {
 const validateBookingAvailability = async ({
   doctorId,
   appointmentDate,
+  date,
   timeSlot,
-  timezone,
+  timezone = "Asia/Kolkata",
   excludeAppointmentId = null,
 }) => {
   const doctor = await User.findOne({ _id: doctorId, role: "doctor" });
@@ -513,7 +514,8 @@ const validateBookingAvailability = async ({
     };
   }
 
-  if (doctor.verificationStatus !== "verified") {
+  const isHospitalDoctor = Boolean(doctor.hospitalId && doctor.status === "active" && doctor.verificationStatus !== "rejected");
+  if (doctor.verificationStatus !== "verified" && !isHospitalDoctor) {
     return {
       isValid: false,
       statusCode: 403,
@@ -521,6 +523,7 @@ const validateBookingAvailability = async ({
     };
   }
 
+  const targetDateInput = appointmentDate || date;
   const cleanTimeSlot =
     typeof timeSlot === "string"
       ? timeSlot.trim()
@@ -528,7 +531,7 @@ const validateBookingAvailability = async ({
       ? String(timeSlot.timeSlot).trim()
       : "";
 
-  if (!appointmentDate || !cleanTimeSlot) {
+  if (!targetDateInput || !cleanTimeSlot) {
     return {
       isValid: false,
       statusCode: 400,
@@ -536,7 +539,7 @@ const validateBookingAvailability = async ({
     };
   }
 
-  const parsedDate = parseDateUTC(appointmentDate);
+  const parsedDate = parseDateUTC(targetDateInput);
   if (!parsedDate) {
     return {
       isValid: false,
@@ -546,7 +549,7 @@ const validateBookingAvailability = async ({
   }
 
   const nowTz = getNowInTimezone(timezone);
-  const targetDateStr = extractDateOnlyStr(appointmentDate, timezone);
+  const targetDateStr = extractDateOnlyStr(targetDateInput, timezone);
 
   // 1. Past Date Check
   if (!targetDateStr || targetDateStr < nowTz.dateStr) {
@@ -565,6 +568,8 @@ const validateBookingAvailability = async ({
       message: "Invalid appointment time slot format. Please select a valid slot.",
     };
   }
+
+  const normalizedTimeSlot = minutesToTimeSlot(slotStartMins);
 
   const dayOfWeekName = getDayOfWeekName(parsedDate, timezone);
   const daySchedule = getDoctorDaySchedule(doctor, dayOfWeekName);
@@ -638,7 +643,10 @@ const validateBookingAvailability = async ({
   const conflictQuery = {
     doctorId: doctor._id,
     appointmentDate: { $gte: startOfDay, $lte: endOfDay },
-    timeSlot: cleanTimeSlot,
+    $or: [
+      { timeSlot: cleanTimeSlot },
+      { timeSlot: normalizedTimeSlot },
+    ],
     status: { $in: ["Scheduled", "Confirmed", "In Progress", "Completed"] },
   };
 
@@ -651,6 +659,7 @@ const validateBookingAvailability = async ({
     return {
       isValid: false,
       statusCode: 409,
+      conflict: true,
       message: `Slot Conflict: ${cleanTimeSlot} on ${targetDateStr} is already reserved by another patient. Please choose another available slot.`,
     };
   }
@@ -660,7 +669,7 @@ const validateBookingAvailability = async ({
     doctor,
     parsedDate,
     targetDateStr,
-    cleanTimeSlot,
+    cleanTimeSlot: normalizedTimeSlot || cleanTimeSlot,
     daySchedule,
   };
 };

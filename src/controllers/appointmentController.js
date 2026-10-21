@@ -589,8 +589,9 @@ const createAppointment = async (req, res) => {
       });
     }
 
-    // Enforce doctor verification restriction: Unverified doctors cannot be booked!
-    if (targetDoctor.verificationStatus !== "verified") {
+    // Enforce doctor verification restriction: Unverified independent doctors cannot be booked!
+    const isHospitalDoctor = Boolean(targetDoctor.hospitalId && targetDoctor.status === "active" && targetDoctor.verificationStatus !== "rejected");
+    if (targetDoctor.verificationStatus !== "verified" && !isHospitalDoctor) {
       return res.status(403).json({
         success: false,
         message: `Dr. ${targetDoctor.name} is currently awaiting medical credential verification and cannot accept appointments at this time.`,
@@ -600,6 +601,7 @@ const createAppointment = async (req, res) => {
     // Strict availability validation (Working days, daily hours, breaks, leaves, elapsed slots, active bookings)
     const availabilityCheck = await validateBookingAvailability({
       doctorId: targetDoctor._id,
+      appointmentDate: parsedDate,
       date: parsedDate,
       timeSlot: cleanTimeSlot,
       timezone: apptTimezone,
@@ -612,6 +614,8 @@ const createAppointment = async (req, res) => {
         reason: availabilityCheck.reason,
       });
     }
+
+    const normalizedTimeSlot = availabilityCheck.cleanTimeSlot || cleanTimeSlot;
 
     // Prevent double booking on backend (Race condition check)
     const startOfDay = new Date(parsedDate.getTime());
@@ -629,7 +633,8 @@ const createAppointment = async (req, res) => {
     });
 
     const existingConflict = activeDayAppointments.find((appt) => {
-      if (String(appt.timeSlot || "").trim().toLowerCase() === cleanTimeSlot.toLowerCase()) {
+      const existingSlotStr = String(appt.timeSlot || "").trim().toLowerCase();
+      if (existingSlotStr === cleanTimeSlot.toLowerCase() || existingSlotStr === normalizedTimeSlot.toLowerCase()) {
         return true;
       }
       if (candidateSlotMins !== -1) {
@@ -728,7 +733,7 @@ const createAppointment = async (req, res) => {
       patientEmail: patientUser.email,
       department: targetDoctor.specialization || department || "General Medicine",
       appointmentDate: parsedDate,
-      timeSlot: cleanTimeSlot,
+      timeSlot: normalizedTimeSlot || cleanTimeSlot,
       consultationType: consultationType || "In-Person",
       type: type || (verifiedFollowUp ? "Follow-up" : "Consultation"),
       reason: finalReason,
@@ -1178,6 +1183,7 @@ const updateAppointment = async (req, res) => {
         // Validate complete doctor availability (Working days, hours, breaks, leaves, elapsed slots, collisions)
         const availabilityCheck = await validateBookingAvailability({
           doctorId: appointment.doctorId,
+          appointmentDate: newDate,
           date: newDate,
           timeSlot: newSlot,
           excludeAppointmentId: appointment._id,
